@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from ocr.solve import (
     decode_image,
     evaluate_math_expression,
+    preprocess_image,
     solve_image_captcha,
 )
 from server import app, _is_solved
@@ -91,6 +92,52 @@ def test_math_expression_division_by_zero():
     assert matched_colon is False
     assert val_colon is None
 
+
+
+def test_math_expression_trailing_question_prompts():
+    cases = [
+        ("30 + 1 = ?", 31),
+        ("4 + 16 = ?", 20),
+        ("8 * 2 = ?", 16),
+        ("3+0=?", 3),
+        ("30 + 1 = _", 31),
+        ("30 + 1 = 7", 31),
+        ("30 + 1 =?", 31),
+        ("4 + 16 =", 20),
+    ]
+    for expr, expected in cases:
+        matched, val, s = evaluate_math_expression(expr)
+        assert matched is True, f"Failed to match: {expr}"
+        assert val == expected, f"Expected {expected}, got {val} for {expr}"
+        assert s == str(expected)
+
+
+def test_math_expression_unicode_operators():
+    cases = [
+        ("6 \u00d7 3", 18),
+        ("20 \u00f7 4", 5),
+        ("6\u00d73=", 18),
+        ("20\u00f74=?", 5),
+    ]
+    for expr, expected in cases:
+        matched, val, s = evaluate_math_expression(expr)
+        assert matched is True, f"Failed to match: {expr}"
+        assert val == expected, f"Expected {expected}, got {val} for {expr}"
+        assert s == str(expected)
+
+
+def test_math_expression_dash_variants_and_negatives():
+    cases = [
+        ("15 – 5", 10),
+        ("15 — 5", 10),
+        ("-5 + 8", 3),
+        ("-10 – -4", -6),
+    ]
+    for expr, expected in cases:
+        matched, val, s = evaluate_math_expression(expr)
+        assert matched is True, f"Failed to match: {expr}"
+        assert val == expected, f"Expected {expected}, got {val} for {expr}"
+        assert s == str(expected)
 
 # ── 2. Non-math text disambiguation ────────────────────────────────────
 
@@ -260,3 +307,80 @@ def test_is_solved_predicate():
     assert _is_solved({"value": 0}) is True
     assert _is_solved({"value": None, "result": ""}) is False
     assert _is_solved({}) is False
+
+
+# ── 6. Preprocessing and transparency ──────────────────────────────────
+
+def test_preprocess_image_rgba_transparency():
+    # Create RGBA image with fully transparent background and solid black pixel
+    rgba = Image.new("RGBA", (50, 50), (0, 0, 0, 0))
+    rgba.putpixel((10, 10), (0, 0, 0, 255))
+    buf = io.BytesIO()
+    rgba.save(buf, format="PNG")
+
+    processed_bytes = preprocess_image(buf.getvalue())
+    im = Image.open(io.BytesIO(processed_bytes))
+    assert im.mode == "RGB"
+    # Transparent background composited onto white (255, 255, 255)
+    assert im.getpixel((0, 0)) == (255, 255, 255)
+    # Black pixel remains black
+    assert im.getpixel((10, 10)) == (0, 0, 0)
+
+
+def test_preprocess_image_trim_right_edge_icon():
+    # 150x40 image with text on the left and an isolated small icon on the right
+    img = Image.new("RGB", (150, 40), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    d.text((10, 10), "30 + 1 =", fill=(0, 0, 0))
+    d.rectangle([135, 10, 145, 20], fill=(0, 0, 0))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+
+    trimmed_bytes = preprocess_image(buf.getvalue())
+    im_trimmed = Image.open(io.BytesIO(trimmed_bytes))
+    assert im_trimmed.size[0] < 150
+    assert im_trimmed.size[0] <= 80
+
+    # Image without right icon should remain untrimmed
+    img_no_icon = Image.new("RGB", (150, 40), (255, 255, 255))
+    d2 = ImageDraw.Draw(img_no_icon)
+    d2.text((10, 10), "30 + 1 =", fill=(0, 0, 0))
+    buf2 = io.BytesIO()
+    img_no_icon.save(buf2, format="PNG")
+
+    untrimmed_bytes = preprocess_image(buf2.getvalue())
+    im_untrimmed = Image.open(io.BytesIO(untrimmed_bytes))
+    assert im_untrimmed.size[0] == 150
+
+
+@pytest.mark.asyncio
+async def test_solve_image_captcha_retry_contrast(monkeypatch):
+    b64 = _make_test_image_b64("30+1=?")
+    calls = []
+
+    class MockOcr:
+        def classification(self, b):
+            calls.append(b)
+            if len(calls) == 1:
+                # First pass: returns noisy non-matching text containing arithmetic hint
+                return "30 + ? 1"
+            # Second pass (enhanced contrast): returns clean math text
+            return "30 + 1 = ?"
+
+    monkeypatch.setattr("ocr.solve.get_ocr", lambda: MockOcr())
+    res = await solve_image_captcha(b64, math_mode="auto")
+    assert len(calls) == 2
+    assert res["is_math"] is True
+    assert res["value"] == 31
+    assert res["result"] == "31"
+    assert res["raw_text"] == "30 + 1 = ?"
+
+
+@pytest.mark.asyncio
+async def test_solve_image_captcha_corrupt_image_force_math():
+    raw_b64 = base64.b64encode(b"not-a-valid-image").decode("utf-8")
+    res = await solve_image_captcha(raw_b64, math_mode="force_math")
+    assert res["is_math"] is False
+    assert res["value"] is None
+    assert res["result"] == ""
+    assert "error" in res
