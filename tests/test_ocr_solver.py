@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 from fastapi.testclient import TestClient
 from ocr.solve import (
     _correct_math_operator,
+    _detect_and_trim_icon,
     _is_plus_operator_glyph,
     _scaled_recovery_image,
     decode_image,
@@ -368,6 +369,49 @@ def test_preprocess_image_trim_right_edge_icon():
     im_untrimmed = Image.open(io.BytesIO(untrimmed_bytes))
     assert im_untrimmed.size[0] == 150
 
+
+def test_detect_and_trim_icon_wide_text_preserves_letters():
+    # Wide text captcha like 3n3d (w=665) with kerning gap before last letter 'd'
+    im = Image.new("RGB", (665, 100), (255, 255, 255))
+    d = ImageDraw.Draw(im)
+    # Text '3n3' on left
+    d.rectangle([50, 20, 440, 80], fill=(0, 0, 0))
+    # Kerning gap from 441 to 464, then letter 'd' from 465 to 585 (width = 121px = 18.2% >= 16%)
+    d.rectangle([465, 20, 585, 80], fill=(0, 0, 0))
+
+    trimmed = _detect_and_trim_icon(im)
+    assert trimmed.size[0] == 665
+
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    assert Image.open(io.BytesIO(preprocess_image(buf.getvalue()))).size[0] == 665
+
+    # Kerning gap ending before 70% width (< 465) with narrow letter
+    im2 = Image.new("RGB", (665, 100), (255, 255, 255))
+    d2 = ImageDraw.Draw(im2)
+    d2.rectangle([50, 20, 420, 80], fill=(0, 0, 0))
+    d2.rectangle([455, 20, 520, 80], fill=(0, 0, 0))
+
+    trimmed2 = _detect_and_trim_icon(im2)
+    assert trimmed2.size[0] == 665
+
+
+def test_detect_and_trim_icon_trims_right_edge_ui_icon():
+    # Narrow UI icon at the right edge (< 16% width, past 70% width) like text_fetghc.jpg (w=196)
+    im = Image.new("RGB", (196, 50), (255, 255, 255))
+    d = ImageDraw.Draw(im)
+    # Text on left
+    d.rectangle([10, 10, 147, 40], fill=(0, 0, 0))
+    # Gap 148..151 (len=4 >= max(3, int(196*0.02)=3))
+    # Reload icon starting at x=152 (~77.5% width >= 70%), width=27px (13.7% < 16%)
+    d.rectangle([152, 10, 178, 40], fill=(0, 0, 0))
+
+    trimmed = _detect_and_trim_icon(im)
+    assert trimmed.size[0] == 148
+
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    assert Image.open(io.BytesIO(preprocess_image(buf.getvalue()))).size[0] == 148
 
 @pytest.mark.asyncio
 async def test_solve_image_captcha_retry_contrast(monkeypatch):

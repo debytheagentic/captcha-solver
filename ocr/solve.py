@@ -88,7 +88,6 @@ def _detect_and_trim_icon(im: Image.Image) -> Image.Image:
     dark_counts = (gray_arr < 170).sum(axis=0)
     has_ink = dark_counts > 2
 
-    min_gap = max(4, int(w * 0.05))
     runs = []
     in_gap = False
     start = 0
@@ -104,14 +103,14 @@ def _detect_and_trim_icon(im: Image.Image) -> Image.Image:
     if in_gap:
         runs.append((start, w))
 
-    right_35_start = int(w * 0.65)
+    right_start = int(w * 0.70)
     for g_start, g_end in runs:
         gap_len = g_end - g_start
-        if gap_len >= min_gap and g_end >= right_35_start and any(has_ink[x] for x in range(0, g_start)):
+        if gap_len >= max(3, int(w * 0.02)) and g_end >= right_start and any(has_ink[x] for x in range(0, g_start)):
             icon_cols = [x for x in range(g_end, w) if has_ink[x]]
             if icon_cols:
                 icon_width = icon_cols[-1] - icon_cols[0] + 1
-                if icon_width < w * 0.25:
+                if icon_width < w * 0.16:
                     return im.crop((0, 0, g_start, h))
     return im
 
