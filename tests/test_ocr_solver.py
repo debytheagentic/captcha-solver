@@ -6,10 +6,13 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 from fastapi.testclient import TestClient
 from ocr.solve import (
+    _is_plus_operator_glyph,
+    _scaled_recovery_image,
     decode_image,
     evaluate_math_expression,
     preprocess_image,
@@ -438,3 +441,118 @@ async def test_solve_dark_mode_neon_text_with_noise_line():
     assert res["is_math"] is True
     assert res["value"] == 54
     assert res["result"] == "54"
+
+
+# ── 7. Geometric operator disambiguation and scaled recovery ──────────
+
+def test_math_expression_trailing_prompt_hallucinations():
+    """Verify trailing prompt hallucinations are stripped: 30+1-0 -> 31, 27+27=7 -> 54."""
+    matched, val, s = evaluate_math_expression("30+1-0")
+    assert matched is True
+    assert val == 31
+    assert s == "31"
+
+    matched, val, s = evaluate_math_expression("27+27=7")
+    assert matched is True
+    assert val == 54
+    assert s == "54"
+
+    matched, val, s = evaluate_math_expression("30+1=0")
+    assert matched is True
+    assert val == 31
+    assert s == "31"
+
+    matched, val, s = evaluate_math_expression("27 + 27 = 7")
+    assert matched is True
+    assert val == 54
+    assert s == "54"
+
+
+def test_geometric_operator_disambiguation_plus_vs_x():
+    """Verify geometric detection disambiguates axis-aligned '+' from diagonal 'x'."""
+    def make_operator_arr(char: str, size: int = 14) -> np.ndarray:
+        arr = np.zeros((30, 80), dtype=np.uint8)
+        cx, cy = 40, 15
+        half = size // 2
+        if char == "+":
+            arr[cy - half : cy + half + 1, cx - 1 : cx + 1] = 255
+            arr[cy - 1 : cy + 1, cx - half : cx + half + 1] = 255
+        elif char == "x":
+            for d in range(-half, half + 1):
+                arr[cy + d, cx + d] = 255
+                arr[cy + d, cx - d] = 255
+        return arr
+
+    plus_arr = make_operator_arr("+", 14)
+    x_arr = make_operator_arr("x", 14)
+
+    # Foreground = 255
+    assert _is_plus_operator_glyph(plus_arr) is True
+    assert _is_plus_operator_glyph(plus_arr, x_start=30, x_end=50) is True
+    assert _is_plus_operator_glyph(x_arr) is False
+    assert _is_plus_operator_glyph(x_arr, x_start=30, x_end=50) is False
+
+    # Inverted foreground (dark ink on white background)
+    assert _is_plus_operator_glyph(255 - plus_arr) is True
+    assert _is_plus_operator_glyph(255 - x_arr) is False
+
+
+@pytest.mark.asyncio
+async def test_solve_image_captcha_operator_disambiguation(monkeypatch):
+    """Verify that solve_image_captcha corrects misread '*' / 'x' to '+' when '+' glyph is present."""
+    img = Image.new("RGB", (120, 30), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+    except Exception:
+        font = ImageFont.load_default()
+    draw.text((15, 5), "30 + 1 = ?", font=font, fill=(0, 0, 0))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    class MockOcrDisambig:
+        def classification(self, b):
+            return "30x1"
+
+    monkeypatch.setattr("ocr.solve.get_ocr", lambda: MockOcrDisambig())
+    res = await solve_image_captcha(b64, math_mode="auto")
+    assert res["is_math"] is True
+    assert res["value"] == 31
+    assert res["result"] == "31"
+
+
+@pytest.mark.asyncio
+async def test_solve_image_captcha_scaled_recovery_pass(monkeypatch):
+    """Verify Pass 2 scaled recovery pass triggers on suspicious multiplication and recovers math."""
+    b64 = _make_test_image_b64("30+1=?")
+    calls = []
+
+    class MockOcrScaledRecovery:
+        def classification(self, b):
+            calls.append(b)
+            if len(calls) == 1:
+                # Pass 1: suspicious math (product > 500 / op2 > 99)
+                return "30 * 190"
+            # Pass 2 (scaled recovery): correctly reads clean math
+            return "30 + 1"
+
+    monkeypatch.setattr("ocr.solve.get_ocr", lambda: MockOcrScaledRecovery())
+    res = await solve_image_captcha(b64, math_mode="auto")
+    assert len(calls) == 2
+    assert res["is_math"] is True
+    assert res["value"] == 31
+    assert res["result"] == "31"
+
+
+def test_scaled_recovery_image_dimensions():
+    """Verify _scaled_recovery_image upscales 1.5x and applies 8px margin padding."""
+    im = Image.new("RGB", (60, 30), color=(255, 255, 255))
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+
+    rec_bytes = _scaled_recovery_image(buf.getvalue())
+    rec_im = Image.open(io.BytesIO(rec_bytes))
+    assert rec_im.size == (106, 53)
+    assert rec_im.getpixel((0, 0)) == 255
