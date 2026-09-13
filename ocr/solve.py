@@ -149,12 +149,16 @@ def _is_plus_operator_glyph(
     else:
         return False
 
+    if arr.ndim == 3:
+        arr = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     if arr.dtype == bool:
         fg = arr.astype(np.uint8) * 255
-    elif np.mean(arr) > 127:
-        fg = (arr < 128).astype(np.uint8) * 255
+    elif np.mean(arr) < 110:
+        # Dark mode: bright text on dark background
+        _, fg = cv2.threshold(arr.astype(np.uint8), 90, 255, cv2.THRESH_BINARY)
     else:
-        fg = (arr > 127).astype(np.uint8) * 255
+        # Light mode: use Otsu dynamic thresholding to reliably segment anti-aliased or light ink
+        _, fg = cv2.threshold(arr.astype(np.uint8), 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
     h_img, w_img = fg.shape[:2]
     if h_img < 6 or w_img < 6:
@@ -392,6 +396,8 @@ async def solve_image_captcha(image_b64: str, math_mode: str = "auto") -> dict:
     else:
         # Operator disambiguation on Pass 1
         raw_ocr_str = _correct_math_operator(raw_ocr_str, processed_bytes)
+        if re.search(r"(?<=\d)\s*[\*xX\u00d7]\s*(?=\d)", raw_ocr_str):
+            raw_ocr_str = _correct_math_operator(raw_ocr_str, img_bytes)
 
         is_matched, val, ans_str = evaluate_math_expression(raw_ocr_str)
         if is_matched:
@@ -399,6 +405,19 @@ async def solve_image_captcha(image_b64: str, math_mode: str = "auto") -> dict:
             value = val
             final_answer_str = ans_str
 
+        # If matched with * or x between two numbers, verify if glyph is actually + and re-evaluate
+        m_op = re.search(r"(-?\d+)\s*([\+\-\*xX\/\:\u00d7\u00f7–—])\s*(-?\d+)", raw_ocr_str)
+        if is_matched and m_op and _OP_MAP.get(m_op.group(2)) == "*":
+            corrected = _correct_math_operator(raw_ocr_str, processed_bytes)
+            if corrected == raw_ocr_str:
+                corrected = _correct_math_operator(raw_ocr_str, img_bytes)
+            if corrected != raw_ocr_str:
+                raw_ocr_str = corrected
+                is_matched, val, ans_str = evaluate_math_expression(raw_ocr_str)
+                if is_matched:
+                    is_math = True
+                    value = val
+                    final_answer_str = ans_str
         # Check for suspicious math in Pass 1:
         # e.g. operator * with product > 500 or second operand > 99 on a 2-operand captcha (such as 30 * 190 = 5700)
         is_suspicious = False
@@ -426,8 +445,19 @@ async def solve_image_captcha(image_b64: str, math_mode: str = "auto") -> dict:
                     pass2_ocr = await asyncio.to_thread(ocr.classification, pass2_bytes)
                 pass2_ocr_str = (pass2_ocr or "").strip()
                 pass2_ocr_str = _correct_math_operator(pass2_ocr_str, pass2_bytes)
+                if re.search(r"(?<=\d)\s*[\*xX\u00d7]\s*(?=\d)", pass2_ocr_str):
+                    pass2_ocr_str = _correct_math_operator(pass2_ocr_str, img_bytes)
 
                 p2_matched, p2_val, p2_ans = evaluate_math_expression(pass2_ocr_str)
+                if p2_matched and p2_val is not None:
+                    m2_op = re.search(r"(-?\d+)\s*([\+\-\*xX\/\:\u00d7\u00f7–—])\s*(-?\d+)", pass2_ocr_str)
+                    if m2_op and _OP_MAP.get(m2_op.group(2)) == "*":
+                        c2 = _correct_math_operator(pass2_ocr_str, pass2_bytes)
+                        if c2 == pass2_ocr_str:
+                            c2 = _correct_math_operator(pass2_ocr_str, img_bytes)
+                        if c2 != pass2_ocr_str:
+                            pass2_ocr_str = c2
+                            p2_matched, p2_val, p2_ans = evaluate_math_expression(pass2_ocr_str)
                 if p2_matched:
                     is_math = True
                     value = p2_val
@@ -441,7 +471,18 @@ async def solve_image_captcha(image_b64: str, math_mode: str = "auto") -> dict:
                         retry_ocr = await asyncio.to_thread(ocr.classification, enh_bytes)
                     retry_ocr_str = (retry_ocr or "").strip()
                     retry_ocr_str = _correct_math_operator(retry_ocr_str, enh_bytes)
+                    if re.search(r"(?<=\d)\s*[\*xX\u00d7]\s*(?=\d)", retry_ocr_str):
+                        retry_ocr_str = _correct_math_operator(retry_ocr_str, img_bytes)
                     retry_matched, retry_val, retry_ans = evaluate_math_expression(retry_ocr_str)
+                    if retry_matched and retry_val is not None:
+                        mr_op = re.search(r"(-?\d+)\s*([\+\-\*xX\/\:\u00d7\u00f7–—])\s*(-?\d+)", retry_ocr_str)
+                        if mr_op and _OP_MAP.get(mr_op.group(2)) == "*":
+                            cr = _correct_math_operator(retry_ocr_str, enh_bytes)
+                            if cr == retry_ocr_str:
+                                cr = _correct_math_operator(retry_ocr_str, img_bytes)
+                            if cr != retry_ocr_str:
+                                retry_ocr_str = cr
+                                retry_matched, retry_val, retry_ans = evaluate_math_expression(retry_ocr_str)
                     if retry_matched:
                         is_math = True
                         value = retry_val

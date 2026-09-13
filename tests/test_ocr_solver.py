@@ -11,6 +11,7 @@ import pytest
 from PIL import Image, ImageDraw, ImageFont
 from fastapi.testclient import TestClient
 from ocr.solve import (
+    _correct_math_operator,
     _is_plus_operator_glyph,
     _scaled_recovery_image,
     decode_image,
@@ -519,6 +520,41 @@ async def test_solve_image_captcha_operator_disambiguation(monkeypatch):
     monkeypatch.setattr("ocr.solve.get_ocr", lambda: MockOcrDisambig())
     res = await solve_image_captcha(b64, math_mode="auto")
     assert res["is_math"] is True
+    assert res["value"] == 31
+    assert res["result"] == "31"
+
+
+@pytest.mark.asyncio
+async def test_is_plus_operator_glyph_with_light_ink(monkeypatch):
+    """Verify dynamic Otsu thresholding detects '+' with light ink (intensity ~160) and 30x1 evaluates to 31."""
+    img = Image.new("RGB", (120, 30), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+    except Exception:
+        font = ImageFont.load_default()
+    # Light gray text with ink intensity ~160 (above 128)
+    draw.text((15, 5), "30 + 1 = ?", font=font, fill=(160, 160, 160))
+
+    # 1. Verify _is_plus_operator_glyph returns True on light ink
+    assert _is_plus_operator_glyph(img) is True
+
+    # 2. Verify _correct_math_operator turns '30x1' into '30+1'
+    assert _correct_math_operator("30x1", img) == "30+1"
+
+    # 3. Verify solve_image_captcha end-to-end corrects 30x1 to 30+1 and evaluates to 31
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    class MockOcrLightInk:
+        def classification(self, b):
+            return "30x1"
+
+    monkeypatch.setattr("ocr.solve.get_ocr", lambda: MockOcrLightInk())
+    res = await solve_image_captcha(b64, math_mode="auto")
+    assert res["is_math"] is True
+    assert res["raw_text"] == "30+1"
     assert res["value"] == 31
     assert res["result"] == "31"
 
