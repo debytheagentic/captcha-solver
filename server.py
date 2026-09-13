@@ -69,12 +69,12 @@ app = FastAPI(
 # the endpoint proceeds — real enforcement stays at the Caddy layer (public domain only).
 _bearer = HTTPBearer(auto_error=False, description="Bearer token (required on the public "
                      "domain; enforced by the reverse proxy). Ignored for local calls.")
-SUPPORTED = ["turnstile", "recaptcha", "hcaptcha", "cloudflare", "awswaf", "botguard", "datadome", "perimeterx", "akamai", "aliyun", "arkose"]
+SUPPORTED = ["turnstile", "recaptcha", "hcaptcha", "cloudflare", "awswaf", "botguard", "datadome", "perimeterx", "akamai", "aliyun", "arkose", "image", "ocr", "math"]
 # Page-level solvers that harvest a cookie/token from the live page (no sitekey needed).
 _PAGE_LEVEL = ("cloudflare", "awswaf", "botguard", "datadome", "perimeterx", "akamai")
 # Solvers that supply their own canonical URL (caller need not pass `url`).
 # datadome is NOT here: the caller passes the DataDome-fronted url (+ referer) itself.
-_SELF_URL = ("botguard", "perimeterx", "aliyun", "arkose")
+_SELF_URL = ("botguard", "perimeterx", "aliyun", "arkose", "image", "ocr", "math")
 # Allow private/loopback targets only when explicitly opted in (dev/testing).
 _ALLOW_PRIVATE = os.getenv("SOLVER_ALLOW_PRIVATE") == "1"
 
@@ -93,7 +93,8 @@ def _is_solved(result: dict) -> bool:
     a truthy value in ANY of these = solved.
     """
     return bool(result.get("token") or result.get("cf_clearance")
-                or result.get("verify_success") or result.get("success"))
+                or result.get("verify_success") or result.get("success")
+                or result.get("result") or (result.get("value") is not None))
 
 
 def _log_solve(type_: str, sitekey: Optional[str], url: str, result: dict):
@@ -241,6 +242,10 @@ class SolveRequest(BaseModel):
     public_key: Optional[str] = Field(None, description="arkose: Arkose public key from the target site's embed. Required for type=arkose.")
     game_type: Optional[str] = Field("4", description="arkose: Arkose game type (default '4').")
 
+    # image/ocr/math
+    image: Optional[str] = Field(None, description="Base64-encoded image string or data URL for image captcha")
+    math_mode: Optional[str] = Field("auto", description="Math evaluation mode: auto | force_math | text (default: auto)")
+
 
 # Named request examples → Swagger UI renders these as a dropdown picker on /solve.
 _SOLVE_EXAMPLES = {
@@ -308,6 +313,10 @@ _SOLVE_EXAMPLES = {
         "summary": "Arkose FunCaptcha (ONNX image prediction)",
         "value": {"type": "arkose", "public_key": "0x0000000000000000000000000000000"},
     },
+    "image": {
+        "summary": "Base64 image OCR / math solver",
+        "value": {"type": "image", "image": "data:image/png;base64,...", "math_mode": "auto"},
+    },
 }
 
 
@@ -328,6 +337,10 @@ class SolveResponse(BaseModel):
     verify_success: Optional[bool] = Field(None, description="realpage variants: token harvested + verified.")
     success: Optional[bool] = Field(None, description="Page-level (cloudflare/awswaf): cookie obtained.")
     cf_clearance: Optional[dict] = Field(None, description="type=cloudflare: the cf_clearance cookie record.")
+    result: Optional[str] = Field(None, description="OCR text or math result for image captchas.")
+    raw_text: Optional[str] = Field(None, description="Raw OCR text before math evaluation.")
+    is_math: Optional[bool] = Field(None, description="Whether the captcha was evaluated as math.")
+    value: Optional[int] = Field(None, description="Integer result for math captchas.")
     model_config = {"extra": "allow"}  # solvers add expires_in, score, cookies, user_agent, post_fetch, …
 
 
@@ -378,6 +391,12 @@ async def _dispatch(req: SolveRequest) -> dict:
 
     Result always carries a top-level "type"; the caller logs + returns it.
     """
+    if req.type in ("image", "ocr", "math"):
+        from ocr.solve import solve_image_captcha
+        mode = "force_math" if req.type == "math" else ("text" if req.type == "ocr" else (req.math_mode or "auto"))
+        r = await solve_image_captcha(req.image, math_mode=mode)
+        return {**r, "type": req.type}
+
     if req.type == "turnstile":
         from turnstile.solve import solve_turnstile, solve_and_verify, solve_turnstile_realpage
         # route-intercept turnstile raises TimeoutError on no-token; catch it here so an
@@ -586,7 +605,10 @@ async def solve(req: SolveRequest = Body(..., openapi_examples=_SOLVE_EXAMPLES))
         raise HTTPException(400, "scene_id and prefix are required for type=aliyun")
     if req.type == "arkose" and not req.public_key:
         raise HTTPException(400, "public_key is required for type=arkose")
-    if req.type not in _PAGE_LEVEL and req.type not in ("aliyun", "arkose") and not req.sitekey:
+    if req.type in ("image", "ocr", "math"):
+        if not req.image:
+            raise HTTPException(400, "image is required for image captcha")
+    if req.type not in _PAGE_LEVEL and req.type not in ("aliyun", "arkose", "image", "ocr", "math") and not req.sitekey:
         raise HTTPException(400, f"sitekey is required for type={req.type}")
     _validate_urls(req)
 

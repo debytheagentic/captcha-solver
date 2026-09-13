@@ -1,0 +1,11 @@
+services:
+  captcha-solver:
+    image: localhost/captcha-solver:latest
+    container_name: captcha-solver
+    restart: always
+    network_mode: "host"
+    user: "1000:1000"
+    userns_mode: "keep-id"
+    environment:
+      PORT: "8877"
+      BROWSER_HEADLESS: "0"

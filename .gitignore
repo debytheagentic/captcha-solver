@@ -18,7 +18,6 @@ apikey.txt
 **/apikey.txt
 
 # Local-only
-tests/
 AGENTS.md
 CLAUDE.md
 .kiro/
