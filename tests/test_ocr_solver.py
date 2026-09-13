@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from fastapi.testclient import TestClient
 from ocr.solve import (
     decode_image,
@@ -111,6 +111,18 @@ def test_math_expression_trailing_question_prompts():
         assert val == expected, f"Expected {expected}, got {val} for {expr}"
         assert s == str(expected)
 
+
+def test_math_expression_dangling_prompts():
+    cases = [
+        ("27+27-", 54),
+        ("30+1=?", 31),
+        ("15-5=", 10),
+    ]
+    for expr, expected in cases:
+        matched, val, s = evaluate_math_expression(expr)
+        assert matched is True, f"Failed to match: {expr}"
+        assert val == expected, f"Expected {expected}, got {val} for {expr}"
+        assert s == str(expected)
 
 def test_math_expression_unicode_operators():
     cases = [
@@ -384,3 +396,45 @@ async def test_solve_image_captcha_corrupt_image_force_math():
     assert res["value"] is None
     assert res["result"] == ""
     assert "error" in res
+
+
+def test_preprocess_image_dark_mode_neon_text():
+    w, h = 200, 50
+    im = Image.new("RGB", (w, h), (11, 14, 20))
+    draw = ImageDraw.Draw(im)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 26)
+    except Exception:
+        font = ImageFont.load_default()
+    draw.text((10, 8), "27 + 27 = ?", fill=(57, 255, 20), font=font)
+    draw.line([(5, 45), (195, 5)], fill=(0, 200, 150), width=1)
+
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    processed = preprocess_image(buf.getvalue())
+    prep_im = Image.open(io.BytesIO(processed))
+    assert prep_im.getpixel((0, 0)) == 255
+    assert prep_im.getpixel((prep_im.width - 1, 0)) == 255
+    assert prep_im.getpixel((0, prep_im.height - 1)) == 255
+
+
+@pytest.mark.asyncio
+async def test_solve_dark_mode_neon_text_with_noise_line():
+    w, h = 200, 50
+    im = Image.new("RGB", (w, h), (11, 14, 20))
+    draw = ImageDraw.Draw(im)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 26)
+    except Exception:
+        font = ImageFont.load_default()
+    draw.text((10, 8), "27 + 27 = ?", fill=(57, 255, 20), font=font)
+    draw.line([(5, 45), (195, 5)], fill=(0, 200, 150), width=1)
+
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    res = await solve_image_captcha(b64, math_mode="auto")
+    assert res["is_math"] is True
+    assert res["value"] == 54
+    assert res["result"] == "54"

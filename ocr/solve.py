@@ -9,6 +9,8 @@ import threading
 import time
 from typing import Optional
 
+import cv2
+import numpy as np
 from PIL import Image, ImageEnhance
 
 _ocr_instance = None
@@ -116,26 +118,64 @@ def _detect_and_trim_icon(im: Image.Image) -> Image.Image:
 
 
 def preprocess_image(data: bytes) -> bytes:
-    """Preprocess image bytes: handle transparency and trim embedded UI icons."""
+    """Preprocess image bytes: handle transparency, dark mode, neon text, and trim icons."""
     try:
         im = Image.open(io.BytesIO(data))
     except Exception:
         return data
 
-    if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
-        bg = Image.new("RGB", im.size, (255, 255, 255))
-        if im.mode != "RGBA":
-            im = im.convert("RGBA")
-        bg.paste(im, mask=im.split()[-1])
-        im = bg
-    elif im.mode != "RGB":
-        im = im.convert("RGB")
+    try:
+        if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            if im.mode != "RGBA":
+                im = im.convert("RGBA")
+            bg.paste(im, mask=im.split()[-1])
+            im = bg
+        elif im.mode != "RGB":
+            im = im.convert("RGB")
 
-    im = _detect_and_trim_icon(im)
+        arr = np.array(im)
+        if arr.size == 0:
+            return data
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        h, w = gray.shape[:2]
+        if h == 0 or w == 0:
+            return data
+        mean_lum = np.mean(gray)
+        corners = [gray[0, 0], gray[0, -1], gray[-1, 0], gray[-1, -1]]
+        is_dark = mean_lum < 115 or np.mean(corners) < 100
 
-    out = io.BytesIO()
-    im.save(out, format="PNG")
-    return out.getvalue()
+        if is_dark:
+            g = arr[:, :, 1].astype(int)
+            r = arr[:, :, 0].astype(int)
+            neon_mask = (g > 110) & (g > r + 20)
+            if neon_mask.sum() > 150:
+                text_white = np.where(neon_mask, 255, 0).astype(np.uint8)
+            else:
+                _, text_white = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY)
+
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            opened = cv2.morphologyEx(text_white, cv2.MORPH_OPEN, kernel)
+
+            y_idx, x_idx = np.where(opened > 0)
+            if y_idx.size > 0:
+                cropped = opened[
+                    max(0, int(y_idx.min()) - 5) : min(h, int(y_idx.max()) + 6),
+                    max(0, int(x_idx.min()) - 5) : min(w, int(x_idx.max()) + 6),
+                ]
+            else:
+                cropped = opened
+
+            final_arr = 255 - cropped
+            im = Image.fromarray(final_arr)
+        else:
+            im = _detect_and_trim_icon(im)
+
+        out = io.BytesIO()
+        im.save(out, format="PNG")
+        return out.getvalue()
+    except Exception:
+        return data
 
 
 def _enhance_image(data: bytes) -> bytes:
@@ -159,7 +199,13 @@ def evaluate_math_expression(text: str) -> tuple[bool, int | None, str]:
     Returns (True, result_int, str(result_int)) if valid arithmetic.
     Returns (False, None, text.strip()) if not matched or division by zero.
     """
-    m = _MATH_RE.match(text)
+    has_prior_op = bool(re.search(r"\d\s*[\+\-\*xX\/\:\u00d7\u00f7–—]\s*\d", text))
+    if has_prior_op:
+        cleaned = re.sub(r"[\=\-\?_–—\s]+$", "", text.strip())
+    else:
+        cleaned = re.sub(r"[\=\?_\s]+$", "", text.strip())
+
+    m = _MATH_RE.match(cleaned)
     if not m:
         return (False, None, text.strip())
     a_str, op_sym, b_str = m.groups()
