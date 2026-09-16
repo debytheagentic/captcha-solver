@@ -1,7 +1,7 @@
 services:
   captcha-solver:
     image: localhost/captcha-solver:latest
-    container_name: captcha-solver
+    container_name: tools-solvers-captcha-solver
     init: true
     restart: always
     network_mode: "host"

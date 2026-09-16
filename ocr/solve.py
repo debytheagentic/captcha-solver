@@ -111,6 +111,50 @@ def _detect_and_trim_icon(im: Image.Image) -> Image.Image:
             if icon_cols:
                 icon_width = icon_cols[-1] - icon_cols[0] + 1
                 if icon_width < w * 0.16:
+                    preceding_runs = []
+                    in_ink = False
+                    r_start = 0
+                    for x in range(g_start):
+                        if has_ink[x]:
+                            if not in_ink:
+                                in_ink = True
+                                r_start = x
+                        else:
+                            if in_ink:
+                                preceding_runs.append((r_start, x))
+                                in_ink = False
+                    if in_ink:
+                        preceding_runs.append((r_start, g_start))
+
+                    glyph_runs = [r for r in preceding_runs if (r[1] - r[0]) >= 2]
+                    if len(glyph_runs) < 3 and len(preceding_runs) >= 3:
+                        glyph_runs = preceding_runs
+
+                    if len(glyph_runs) >= 3:
+                        median_w = float(np.median([r[1] - r[0] for r in glyph_runs]))
+                        cand_x0 = icon_cols[0]
+                        cand_x1 = icon_cols[-1] + 1
+                        cand_mask = gray_arr[:, cand_x0:cand_x1] < 170
+                        cand_y_idx = np.where(cand_mask.any(axis=1))[0]
+                        prec_mask = gray_arr[:, :g_start] < 170
+                        prec_y_idx = np.where(prec_mask.any(axis=1))[0]
+
+                        if cand_y_idx.size > 0 and prec_y_idx.size > 0 and median_w > 0:
+                            cand_y0, cand_y1 = int(cand_y_idx.min()), int(cand_y_idx.max()) + 1
+                            prec_y0, prec_y1 = int(prec_y_idx.min()), int(prec_y_idx.max()) + 1
+                            cand_h = cand_y1 - cand_y0
+                            prec_h = prec_y1 - prec_y0
+                            if cand_h > 0 and prec_h > 0:
+                                height_ratio = min(cand_h, prec_h) / float(max(cand_h, prec_h))
+                                overlap = max(0, min(cand_y1, prec_y1) - max(cand_y0, prec_y0))
+                                overlap_ratio = overlap / float(min(cand_h, prec_h))
+                                if (
+                                    0.4 <= (icon_width / median_w) <= 2.2
+                                    and height_ratio >= 0.60
+                                    and overlap_ratio >= 0.60
+                                    and gap_len < max(12, int(w * 0.10))
+                                ):
+                                    continue
                     return im.crop((0, 0, g_start, h))
     return im
 
@@ -286,6 +330,24 @@ def preprocess_image(data: bytes) -> bytes:
             im = Image.fromarray(final_arr)
         else:
             im = _detect_and_trim_icon(im)
+            w, h = im.size
+            gray = np.array(im.convert("L"))
+            mean_lum = float(np.mean(gray))
+            if mean_lum > 180 and w >= 200 and h >= 60 and (w / float(h) >= 2.2):
+                dark_mask = gray < 130
+                if dark_mask.sum() > 20:
+                    y_indices, x_indices = np.where(dark_mask)
+                    x0, x1 = int(x_indices.min()), int(x_indices.max()) + 1
+                    y0, y1 = int(y_indices.min()), int(y_indices.max()) + 1
+                    ink_w = x1 - x0
+                    ink_h = y1 - y0
+                    if ink_h > 0 and ink_w > 0 and ink_h < h * 0.65 and ink_w < w * 0.95:
+                        bin_crop = np.where(dark_mask[y0:y1, x0:x1], 0, 255).astype(np.uint8)
+                        im_crop = Image.fromarray(bin_crop)
+                        new_h = 36
+                        new_w = max(20, int(ink_w * (new_h / float(ink_h))))
+                        im_resized = im_crop.resize((new_w, new_h), Image.Resampling.BILINEAR)
+                        im = ImageOps.expand(im_resized, border=(12, 6, 12, 6), fill=255)
 
         out = io.BytesIO()
         im.save(out, format="PNG")

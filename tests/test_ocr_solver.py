@@ -413,6 +413,35 @@ def test_detect_and_trim_icon_trims_right_edge_ui_icon():
     im.save(buf, format="PNG")
     assert Image.open(io.BytesIO(preprocess_image(buf.getvalue()))).size[0] == 148
 
+def test_detect_and_trim_icon_preserves_5th_and_6th_character_glyphs():
+    # 220x80 canvas with 5 characters (e.g. width 21px each, gap 6-8px)
+    im5 = Image.new("RGB", (220, 80), (255, 255, 255))
+    d5 = ImageDraw.Draw(im5)
+    x = 45
+    for _ in range(5):
+        d5.rectangle([x, 25, x + 21, 55], fill=(0, 0, 0))
+        x += 21 + 7
+
+    trimmed5 = _detect_and_trim_icon(im5)
+    assert trimmed5.size[0] == 220
+
+    buf5 = io.BytesIO()
+    im5.save(buf5, format="PNG")
+    proc5_bytes = preprocess_image(buf5.getvalue())
+    proc5 = Image.open(io.BytesIO(proc5_bytes))
+    assert proc5.size[0] > 150
+
+    # 200x50 canvas with 6 characters (e.g. width 18px each, gap 6px)
+    im6 = Image.new("RGB", (200, 50), (255, 255, 255))
+    d6 = ImageDraw.Draw(im6)
+    x6 = 20
+    for _ in range(6):
+        d6.rectangle([x6, 10, x6 + 18, 40], fill=(0, 0, 0))
+        x6 += 18 + 6
+
+    trimmed6 = _detect_and_trim_icon(im6)
+    assert trimmed6.size[0] == 200
+
 @pytest.mark.asyncio
 async def test_solve_image_captcha_retry_contrast(monkeypatch):
     b64 = _make_test_image_b64("30+1=?")
