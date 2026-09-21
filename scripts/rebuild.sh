@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
-./scripts/build.sh
+./scripts/pull-ci.sh
 podman compose down 2>/dev/null || true
 podman compose up -d
 

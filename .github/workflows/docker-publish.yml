@@ -1,0 +1,29 @@
+name: docker-publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        run: docker build -f Containerfile -t captcha-solver:latest .
+
+      - name: Save image to tarball
+        run: docker save captcha-solver:latest | gzip > captcha-solver-image.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: captcha-solver-image
+          path: captcha-solver-image.tar.gz
+          retention-days: 7

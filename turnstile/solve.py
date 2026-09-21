@@ -33,6 +33,17 @@ def _error_codes(body: str) -> list:
     return data.get("error-codes") or data.get("details") or []
 
 
+def _turnstile_div(sitekey: str, action: str = None, cdata: str = None) -> str:
+    """Build the .cf-turnstile widget div for the route-intercept template."""
+    parts = [f'<div class="cf-turnstile" data-sitekey="{sitekey}"']
+    if action:
+        parts.append(f' data-action="{action}"')
+    if cdata:
+        parts.append(f' data-cdata="{cdata}"')
+    parts.append('></div>')
+    return "".join(parts)
+
+
 # ── Route-intercept (fast, generic) ─────────────────────────────────
 
 async def _get_turnstile_response_route(page, max_attempts: int = 20) -> str:
@@ -62,10 +73,7 @@ async def solve_turnstile(sitekey: str, url: str, action: str = None,
     t0 = time.monotonic()
     async with _solve_lock:
         target = url
-        div = (f'<div class="cf-turnstile" data-sitekey="{sitekey}"'
-               + (f' data-action="{action}"' if action else '')
-               + (f' data-cdata="{cdata}"' if cdata else '')
-               + '></div>')
+        div = _turnstile_div(sitekey, action, cdata)
         page_data = HTML_TEMPLATE.replace("<!-- cf turnstile -->", div)
 
         async with await cloakbrowser.launch_async(**_browser_kwargs(proxy)) as browser:
@@ -92,10 +100,7 @@ async def solve_and_verify(sitekey: str, verify_url: str,
     t0 = time.monotonic()
     async with _solve_lock:
         target = page_url or verify_url
-        div = (f'<div class="cf-turnstile" data-sitekey="{sitekey}"'
-               + (f' data-action="{action}"' if action else '')
-               + (f' data-cdata="{cdata}"' if cdata else '')
-               + '></div>')
+        div = _turnstile_div(sitekey, action, cdata)
         page_data = HTML_TEMPLATE.replace("<!-- cf turnstile -->", div)
 
         async with await cloakbrowser.launch_async(**_browser_kwargs(proxy)) as browser:
@@ -134,19 +139,66 @@ async def solve_and_verify(sitekey: str, verify_url: str,
 
 # Sitekey is passed as the evaluate() arg `k` — never interpolated into JS source
 # (injection-safe). No data-theme: a hard-coded theme is a fixed real-page fingerprint.
-_WIDGET_INJECT_JS = (
-    "(k) => {"
-    "  const d = document.createElement('div');"
-    "  d.className = 'cf-turnstile';"
-    "  d.setAttribute('data-sitekey', k);"
-    "  document.body.prepend(d);"
-    "}"
-)
+_WIDGET_INJECT_JS = """
+async (k) => {
+  const SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+  if (!document.querySelector('script[src*="turnstile/v0/api.js"]')) {
+    const s = document.createElement('script');
+    s.src = SRC;
+    s.async = true;
+    document.head.appendChild(s);
+  }
+  const deadline = Date.now() + 5000;
+  while (!(window.turnstile && typeof window.turnstile.render === 'function')) {
+    if (Date.now() >= deadline) { break; }
+    await new Promise(r => setTimeout(r, 100));
+  }
+  let container = document.getElementById('cf-turnstile-auto-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'cf-turnstile-auto-container';
+    container.className = 'cf-turnstile';
+    document.body.prepend(container);
+  }
+  if (window.turnstile && typeof window.turnstile.render === 'function') {
+    try {
+      window.__turnstileWidgetId = window.turnstile.render(container, { sitekey: k });
+      return;
+    } catch (e) { /* fall through to attribute fallback */ }
+  }
+  container.setAttribute('data-sitekey', k);
+}
+"""
 
 
 async def _inject_turnstile_widget(page, sitekey: str) -> None:
     """Inject a .cf-turnstile widget with the sitekey passed as data (evaluate arg)."""
     await page.evaluate(_WIDGET_INJECT_JS, sitekey)
+
+
+# Multi-vector token harvest: JS API → custom property → input → textarea.
+_GET_TOKEN_JS = """
+() => {
+  if (typeof turnstile !== 'undefined' && typeof turnstile.getResponse === 'function') {
+    let t = '';
+    if (window.__turnstileWidgetId !== undefined) {
+      try { t = turnstile.getResponse(window.__turnstileWidgetId); } catch (e) { t = ''; }
+    }
+    if (!t) {
+      try { t = turnstile.getResponse(); } catch (e) { t = ''; }
+    }
+    if (t) { return t; }
+  }
+  if (window.turnstileToken) { return window.turnstileToken; }
+  for (const el of document.querySelectorAll('input[name="cf-turnstile-response"], [name="cf-turnstile-response"]')) {
+    if (el.value) { return el.value; }
+  }
+  for (const el of document.querySelectorAll('textarea[name="cf-turnstile-response"]')) {
+    if (el.value) { return el.value; }
+  }
+  return '';
+}
+"""
 
 
 async def _human_click_iframe(page, fr) -> bool:
@@ -219,7 +271,15 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
         async with await cloakbrowser.launch_async(**_browser_kwargs(proxy)) as browser:
             page = await browser.new_page()
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                except Exception as e:
+                    _nav_err = str(e)
+                    if "ERR_TUNNEL_CONNECTION_FAILED" in _nav_err or "ERR_PROXY_CONNECTION_FAILED" in _nav_err:
+                        log.warning("Real-page nav failed (tunnel/proxy): %s", e)
+                        return {"token": "", "verify_success": False, "error": str(e),
+                                "method": "real-page", "elapsed": round(time.monotonic() - t0, 1)}
+                    log.warning("Real-page nav interrupted, continuing: %s", e)
 
                 if pre_actions:
                     await run_pre_actions(page, pre_actions)
@@ -238,9 +298,7 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
                 deadline = time.monotonic() + timeout_s
                 while time.monotonic() < deadline:
                     try:
-                        token = await page.evaluate(
-                            "() => { const e=document.querySelector('[name=cf-turnstile-response]');"
-                            " return e ? e.value : '' }")
+                        token = await page.evaluate(_GET_TOKEN_JS)
                     except Exception:
                         token = ""
                     if token:
