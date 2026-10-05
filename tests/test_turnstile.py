@@ -4,6 +4,7 @@ No browser launch and no image rendering: JS snippets are syntax-checked with
 node and the token-harvest snippet is executed against mocked globals; the
 route-intercept widget-div builder is tested directly.
 """
+import inspect
 import shutil
 import subprocess
 import sys
@@ -13,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from turnstile.solve import _GET_TOKEN_JS, _WIDGET_INJECT_JS, _turnstile_div
+from turnstile.solve import _GET_TOKEN_JS, _WIDGET_INJECT_JS, _turnstile_div, solve_turnstile_realpage
 
 NODE = shutil.which("node")
 
@@ -111,7 +112,16 @@ def test_turnstile_div_omits_empty_optional_attrs():
 
 
 def test_js_snippets_do_not_interpolate_sitekey():
-    # Zero secret exposure: sitekey is the evaluate() arg `k`, never baked into source.
-    assert "sitekey: k" in _WIDGET_INJECT_JS
+    # Zero secret exposure: evaluate receives arguments object ({ sitekey, action, cdata }), never baked into source.
+    assert "const renderOpts = { sitekey };" in _WIDGET_INJECT_JS
     assert "{sitekey" not in _WIDGET_INJECT_JS
     assert "{sitekey" not in _GET_TOKEN_JS
+
+
+def test_solve_turnstile_realpage_signature_accepts_action_and_cdata():
+    sig = inspect.signature(solve_turnstile_realpage)
+    params = sig.parameters
+    assert "action" in params
+    assert "cdata" in params
+    assert params["action"].default is None
+    assert params["cdata"].default is None

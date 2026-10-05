@@ -410,7 +410,8 @@ async def _dispatch(req: SolveRequest) -> dict:
             elif req.real_page:
                 actions, fetches = _extract(req)
                 r = await solve_turnstile_realpage(
-                    req.url, req.sitekey, req.timeout_s, actions, fetches, proxy=req.proxy)
+                    req.url, req.sitekey, req.timeout_s, actions, fetches,
+                    action=req.action, cdata=req.cdata, proxy=req.proxy)
             else:
                 r = await solve_turnstile(
                     req.sitekey, req.url, req.action, req.cdata, proxy=req.proxy)

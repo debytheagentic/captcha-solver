@@ -46,24 +46,23 @@ def _turnstile_div(sitekey: str, action: str = None, cdata: str = None) -> str:
 
 # ── Route-intercept (fast, generic) ─────────────────────────────────
 
-async def _get_turnstile_response_route(page, max_attempts: int = 20) -> str:
+async def _get_turnstile_response_route(page, max_attempts: int = 25) -> str:
     """Retrieve token from route-intercepted page (Theyka pattern)."""
-    for _ in range(max_attempts):
+    clicked = False
+    for attempt in range(max_attempts):
         try:
             val = await page.input_value("[name=cf-turnstile-response]")
-            if val == "":
-                try:
-                    await page.click("//div[@class='cf-turnstile']", timeout=3000)
-                except Exception:
-                    pass
-                await asyncio.sleep(1)
-            else:
-                el = await page.query_selector("[name=cf-turnstile-response]")
-                if el:
-                    return await el.get_attribute("value")
-                break
+            if val:
+                return val
         except Exception:
-            await asyncio.sleep(1)
+            pass
+        if not clicked and attempt >= 2:
+            clicked = True
+            try:
+                await _click_turnstile_checkbox(page, attempts=5)
+            except Exception:
+                pass
+        await asyncio.sleep(1)
     raise TimeoutError("Token not received via route-intercept")
 
 
@@ -137,10 +136,10 @@ async def solve_and_verify(sitekey: str, verify_url: str,
 
 # ── Real-page solver ────────────────────────────────────────────────
 
-# Sitekey is passed as the evaluate() arg `k` — never interpolated into JS source
+# Evaluated parameters ({ sitekey, action, cdata }) are passed as arguments — never interpolated into JS source
 # (injection-safe). No data-theme: a hard-coded theme is a fixed real-page fingerprint.
 _WIDGET_INJECT_JS = """
-async (k) => {
+async ({ sitekey, action, cdata }) => {
   const SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
   if (!document.querySelector('script[src*="turnstile/v0/api.js"]')) {
     const s = document.createElement('script');
@@ -162,18 +161,27 @@ async (k) => {
   }
   if (window.turnstile && typeof window.turnstile.render === 'function') {
     try {
-      window.__turnstileWidgetId = window.turnstile.render(container, { sitekey: k });
+      const renderOpts = { sitekey };
+      if (action) renderOpts.action = action;
+      if (cdata) renderOpts.cData = cdata;
+      window.__turnstileWidgetId = window.turnstile.render(container, renderOpts);
       return;
     } catch (e) { /* fall through to attribute fallback */ }
   }
-  container.setAttribute('data-sitekey', k);
+  container.setAttribute('data-sitekey', sitekey);
+  if (action) container.setAttribute('data-action', action);
+  if (cdata) container.setAttribute('data-cdata', cdata);
 }
 """
 
 
-async def _inject_turnstile_widget(page, sitekey: str) -> None:
-    """Inject a .cf-turnstile widget with the sitekey passed as data (evaluate arg)."""
-    await page.evaluate(_WIDGET_INJECT_JS, sitekey)
+async def _inject_turnstile_widget(page, sitekey: str, action: str = None, cdata: str = None) -> None:
+    """Inject a .cf-turnstile widget with sitekey, action, and cdata passed as evaluate data (injection-safe)."""
+    await page.evaluate(_WIDGET_INJECT_JS, {
+        "sitekey": sitekey,
+        "action": action,
+        "cdata": cdata,
+    })
 
 
 # Multi-vector token harvest: JS API → custom property → input → textarea.
@@ -247,6 +255,8 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
                                    timeout_s: int = 60,
                                    pre_actions: list = None,
                                    post_fetch: list = None,
+                                   action: str = None,
+                                   cdata: str = None,
                                    proxy: str = None) -> dict:
     """Navigate a real page, execute pre_actions, click the CF Turnstile checkbox,
     return the token and browser cookies.
@@ -287,7 +297,7 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
 
                 # Inject sitekey widget if given (override page's own).
                 if sitekey:
-                    await _inject_turnstile_widget(page, sitekey)
+                    await _inject_turnstile_widget(page, sitekey, action=action, cdata=cdata)
                     await asyncio.sleep(3)
 
                 clicked = await _click_turnstile_checkbox(page)
