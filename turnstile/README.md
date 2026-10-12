@@ -169,6 +169,11 @@ Rule of thumb: **2xx → read `solved`; non-2xx → read `detail`. Never both.**
 | `PORT`               | `8877`  | HTTP server port                                |
 | `BROWSER_HEADLESS`   | `1`     | Global. `0` = headed (needs Xvfb). Service sets `0`. |
 | `TURNSTILE_GEOIP`    | —       | Set to `1` to spoof tz/locale/WebGL to match IP |
+| `TURNSTILE_OFFLOAD_ENABLED` | — | Set to `1` to offload solves to a secondary pool when the local seat is busy |
+| `TURNSTILE_OFFLOAD_URL` | — | Pool endpoint, e.g. `http://127.0.0.1:8878/solve` (`{base}/health` is probed first) |
+| `TURNSTILE_OFFLOAD_TIMEOUT` | `60` | Offload POST deadline (s) |
+| `TURNSTILE_OFFLOAD_HEALTH_TIMEOUT` | `2.0` | `/health` probe deadline (s) |
+| `TURNSTILE_OFFLOAD_COOLDOWN` | `30` | Breaker cooldown after a failed offload (s) |
 
 Proxy is per-request only: pass `"proxy"` on `POST /solve`. No env fallback.
 

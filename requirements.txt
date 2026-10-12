@@ -4,6 +4,9 @@ fastapi
 uvicorn
 pydantic
 cloakbrowser
+httpx
+# turnstile hybrid offload: POSTs bursts to the secondary solver pool (turnstile/offload.py).
+# (FastAPI/starlette already pull httpx in transitively; declared here because we import it.)
 pillow
 # aliyun solver gap detector: YOLOv8n ONNX (thread-limited to 2 cores) with a cv2
 # fallback. opencv-python-headless (not the GUI build — no libGL on servers).

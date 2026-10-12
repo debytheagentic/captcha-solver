@@ -403,18 +403,32 @@ async def _dispatch(req: SolveRequest) -> dict:
         # unsolved turnstile returns a uniform 200 {error}, not a collision with the real
         # asyncio deadline (408).
         try:
+            # Each mode becomes a zero-arg closure so the hybrid router can pick the lane
+            # (local seat vs SCTG pool offload) without duplicating the per-mode plumbing.
             if req.verify_url and req.verify_payload:
-                r = await solve_and_verify(
-                    req.sitekey, req.verify_url, req.verify_payload, req.action,
-                    cdata=req.cdata, page_url=req.page_url, proxy=req.proxy)
+                kind = "verify"
+
+                async def _local():
+                    return await solve_and_verify(
+                        req.sitekey, req.verify_url, req.verify_payload, req.action,
+                        cdata=req.cdata, page_url=req.page_url, proxy=req.proxy)
             elif req.real_page:
                 actions, fetches = _extract(req)
-                r = await solve_turnstile_realpage(
-                    req.url, req.sitekey, req.timeout_s, actions, fetches,
-                    action=req.action, cdata=req.cdata, proxy=req.proxy)
+                kind = "real_page"
+
+                async def _local():
+                    return await solve_turnstile_realpage(
+                        req.url, req.sitekey, req.timeout_s, actions, fetches,
+                        action=req.action, cdata=req.cdata, proxy=req.proxy)
             else:
-                r = await solve_turnstile(
-                    req.sitekey, req.url, req.action, req.cdata, proxy=req.proxy)
+                kind = "route"
+
+                async def _local():
+                    return await solve_turnstile(
+                        req.sitekey, req.url, req.action, req.cdata, proxy=req.proxy)
+            from turnstile.solve import _solve_lock
+            from turnstile.offload import solve_turnstile_maybe_offload
+            r = await solve_turnstile_maybe_offload(req, _local, kind, lock=_solve_lock)
         except TimeoutError as e:
             r = {"token": "", "error": str(e), "method": "route"}
         return {"type": "turnstile", **r}
