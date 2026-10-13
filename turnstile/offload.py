@@ -169,8 +169,13 @@ async def solve_turnstile_maybe_offload(req, local_call, kind: str, lock=None) -
         from turnstile.solve import _solve_lock as lock
 
     if await should_offload(lock):
+        log.info("[ROUTER] Local CloakBrowser is busy (locked). Offloading Turnstile "
+                 "request to secondary pool (%s)...", _OFFLOAD_URL)
         r = await solve_via_pool(_offload_payload(req, kind))
         if r.get("token"):
+            log.info("[ROUTER] Secondary pool (%s) solved Turnstile in %.1fs (token len: %d)",
+                     _OFFLOAD_URL, r.get("elapsed", 0), len(r.get("token", "")))
             return r
-        log.info("Offload produced no token (%s); falling back to local queue", r.get("error"))
+        log.info("[ROUTER] Secondary pool produced no token (%s); falling back to local queue",
+                 r.get("error"))
     return await local_call()          # queued local solve = graceful degradation
