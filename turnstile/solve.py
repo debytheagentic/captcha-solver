@@ -284,12 +284,12 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 except Exception as e:
-                    _nav_err = str(e)
-                    if "ERR_TUNNEL_CONNECTION_FAILED" in _nav_err or "ERR_PROXY_CONNECTION_FAILED" in _nav_err:
-                        log.warning("Real-page nav failed (tunnel/proxy): %s", e)
-                        return {"token": "", "verify_success": False, "error": str(e),
-                                "method": "real-page", "elapsed": round(time.monotonic() - t0, 1)}
-                    log.warning("Real-page nav interrupted, continuing: %s", e)
+                    # A failed goto leaves a blank document: no widget, no token. Harvesting
+                    # anyway burns the full timeout_s on a dead page while holding the single
+                    # seat, so fail fast and release the lock immediately.
+                    log.warning("Real-page nav failed: %s", e)
+                    return {"token": "", "verify_success": False, "error": f"nav_failed: {e}",
+                            "method": "real-page", "elapsed": round(time.monotonic() - t0, 1)}
 
                 if pre_actions:
                     await run_pre_actions(page, pre_actions)

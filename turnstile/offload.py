@@ -12,10 +12,12 @@ locally or offload to a secondary solver pool (sctg-api-pool, default
 everyone else is offloaded.
 """
 import asyncio
+import ipaddress
 import logging
 import os
 import time
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -76,8 +78,41 @@ async def secondary_healthy() -> bool:
     return ok
 
 
-async def should_offload(local_lock: asyncio.Lock) -> bool:
-    """NON-BLOCKING decision: never `await lock.acquire()` to decide."""
+_LOCAL_SUFFIXES = (".local", ".lan", ".internal", ".home.arpa")
+
+
+def _proxy_is_local(proxy: Optional[str]) -> bool:
+    """True when `proxy` targets a private/loopback/link-local host.
+
+    The pool strips private-LAN proxies, so only the local browser can reproduce such
+    a request. Hostnames are matched on local TLDs rather than resolved: `getaddrinfo`
+    would block the event loop, and a misjudged public host merely degrades to the
+    local queue instead of minting an invalid token.
+    """
+    if not proxy:
+        return False                   # no proxy -> nothing the pool must reproduce
+    host = (urlsplit(proxy if "//" in proxy else f"//{proxy}").hostname or "")
+    if not host:
+        return True                    # unparseable -> assume LAN-side
+    host = host.lower().rstrip(".")
+    if host == "localhost" or host.endswith(_LOCAL_SUFFIXES):
+        return True
+    try:
+        # is_global (not is_private): also flags CGNAT 100.64/10 and the reserved ranges.
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        return False                   # a DNS name -> the pool can reach it too
+
+
+async def should_offload(local_lock: asyncio.Lock, req) -> bool:
+    """NON-BLOCKING decision: never `await lock.acquire()` to decide.
+
+    `real_page` and private-LAN-proxied requests are NEVER offloaded: SCTG runs no
+    `jsd/main.js` telemetry and strips private proxies, so its token fails Cloudflare
+    server-side validation. Those requests wait for the local CloakBrowser seat.
+    """
+    if req.real_page or _proxy_is_local(req.proxy):
+        return False                   # pool can't reproduce this request -> local seat only
     if not offload_available():        # enabled + not circuit-broken
         return False
     if not local_lock.locked():
@@ -168,7 +203,7 @@ async def solve_turnstile_maybe_offload(req, local_call, kind: str, lock=None) -
     if lock is None:
         from turnstile.solve import _solve_lock as lock
 
-    if await should_offload(lock):
+    if await should_offload(lock, req):
         log.info("[ROUTER] Local CloakBrowser is busy (locked). Offloading Turnstile "
                  "request to secondary pool (%s)...", _OFFLOAD_URL)
         r = await solve_via_pool(_offload_payload(req, kind))

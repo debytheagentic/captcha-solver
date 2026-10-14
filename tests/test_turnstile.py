@@ -4,6 +4,7 @@ No browser launch and no image rendering: JS snippets are syntax-checked with
 node and the token-harvest snippet is executed against mocked globals; the
 route-intercept widget-div builder is tested directly.
 """
+import asyncio
 import inspect
 import shutil
 import subprocess
@@ -125,3 +126,53 @@ def test_solve_turnstile_realpage_signature_accepts_action_and_cdata():
     assert "cdata" in params
     assert params["action"].default is None
     assert params["cdata"].default is None
+
+
+@pytest.mark.parametrize("exc", [
+    TimeoutError("page.goto: Timeout 45000ms exceeded"),
+    RuntimeError("net::ERR_CONNECTION_CLOSED"),
+    RuntimeError("net::ERR_TIMED_OUT"),
+    RuntimeError("net::ERR_EMPTY_RESPONSE"),
+])
+def test_realpage_nav_failure_fails_fast_without_harvesting(monkeypatch, exc):
+    """A dead/blank page has no widget: the 140s harvest loop must never run, so the
+    single seat is released immediately instead of burning the whole timeout_s."""
+    calls = {"goto": 0, "evaluate": 0, "closed": 0}
+
+    class _Page:
+        async def goto(self, *a, **k):
+            calls["goto"] += 1
+            raise exc
+
+        async def evaluate(self, *a, **k):
+            calls["evaluate"] += 1
+            return ""
+
+        async def close(self):
+            calls["closed"] += 1
+
+    class _Browser:
+        async def new_page(self):
+            return _Page()
+
+    class _Launcher:
+        async def __aenter__(self):
+            return _Browser()
+
+        async def __aexit__(self, *a):
+            return False
+
+    async def _launch(**_kw):
+        return _Launcher()
+
+    monkeypatch.setattr("turnstile.solve.cloakbrowser.launch_async", _launch)
+
+    r = asyncio.run(solve_turnstile_realpage("https://dead.example.com/", "0xSITEKEY", timeout_s=140))
+
+    assert calls["goto"] == 1
+    assert calls["evaluate"] == 0, "harvested a token off a page that never loaded"
+    assert calls["closed"] == 1, "browser page leaked"
+    assert r == {"token": "", "verify_success": False,
+                 "error": f"nav_failed: {exc}",
+                 "method": "real-page", "elapsed": r["elapsed"]}
+    assert r["elapsed"] < 5

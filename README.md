@@ -126,7 +126,7 @@ browser.
 | `RECAPTCHA_GEOIP`       | unset   | `1` = same geo alignment for the reCAPTCHA browser |
 | `SOLVER_ALLOW_PRIVATE`  | unset   | `1` = allow `url`/`verify_url`/`post_fetch` targets on private/loopback/link-local hosts (SSRF guard off). Leave unset in prod. |
 | `SOLVER_PUBLIC_URL`     | (placeholder) | Public base URL shown in the OpenAPI docs (servers dropdown + contact). Set to your real domain at runtime. |
-| `TURNSTILE_OFFLOAD_ENABLED` | unset | `1` = hybrid offload router on. Busy local seat + healthy pool ⇒ solve via the pool instead of queueing. |
+| `TURNSTILE_OFFLOAD_ENABLED` | unset | `1` = hybrid offload router on. Busy local seat + healthy pool ⇒ solve via the pool instead of queueing. Requests the pool can't reproduce (`real_page: true`, or a private-LAN proxy — SCTG runs no `jsd/main.js` telemetry and strips private proxies, so its token fails Cloudflare validation) are **never** offloaded; they wait for the local seat. |
 | `TURNSTILE_OFFLOAD_URL`  | unset   | Secondary solver endpoint, e.g. `http://127.0.0.1:8878/solve` (sctg-api-pool). Required when offload is on. |
 | `TURNSTILE_OFFLOAD_TIMEOUT` | `60` | Offload POST deadline (s). |
 | `TURNSTILE_OFFLOAD_HEALTH_TIMEOUT` | `2.0` | Pool `/health` probe deadline (s). |

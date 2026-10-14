@@ -183,6 +183,67 @@ def test_busy_seat_offloads_to_healthy_pool():
     finally:
         pool.close()
 
+# ── 3b. Un-offloadable requests keep the local seat ────────────────────
+
+@pytest.mark.parametrize("req_kw,reason", [
+    ({"real_page": True}, "real_page"),
+    ({"proxy": "http://192.168.1.100:8080"}, "192.168.x LAN proxy"),
+    ({"proxy": "http://127.0.0.1:3128"}, "loopback proxy"),
+    ({"proxy": "socks5://localhost:1080"}, "scheme-less dialect, hostname localhost"),
+    ({"proxy": "http://user:pass@10.0.0.5:8888"}, "credentials stripped before host parse"),
+    ({"proxy": "http://169.254.1.1:80"}, "link-local proxy"),
+    ({"proxy": "http://[fd00::1]:80"}, "private IPv6 proxy"),
+    ({"proxy": "http://cloakbox.lan:8080"}, "local-TLD hostname proxy"),
+    ({"proxy": "http://proxy.internal:8080"}, "internal-TLD hostname proxy"),
+    ({"real_page": True, "proxy": "http://8.8.8.8:80"}, "real_page wins over a public proxy"),
+    ({"proxy": "http://192.168.1.100:80", "verify_url": "https://x.example.com"}, "LAN proxy"),
+])
+def test_unreproducible_requests_never_offload(req_kw, reason):
+    """SCTG runs no jsd/main.js telemetry and strips private proxies -> its token fails
+    Cloudflare validation. Such requests must wait for the local seat, not be offloaded."""
+    pool = _StubPool()
+    try:
+        offload._OFFLOAD_ENABLED = True
+        offload._OFFLOAD_URL = pool.url
+        ran = []
+
+        async def local():
+            ran.append(1)
+            return {"token": "local-token", "method": "route"}
+
+        r = asyncio.run(offload.solve_turnstile_maybe_offload(
+            _Req(**req_kw), local, "real_page", lock=_busy_lock()))
+
+        assert r["token"] == "local-token", reason
+        assert ran == [1], reason                 # seat served it despite being busy
+        assert pool.solve_calls == [], reason     # pool never POSTed
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("proxy", [
+    "http://8.8.8.8:3128",                         # public IPv4
+    "http://[2606:4700::1111]:3128",               # public IPv6
+    "http://proxy.example.com:3128",               # DNS name the pool can reach too
+])
+def test_public_proxy_still_offloads(proxy):
+    """The veto is scoped to LAN hosts: a public proxy remains offloadable."""
+    pool = _StubPool()
+    try:
+        offload._OFFLOAD_ENABLED = True
+        offload._OFFLOAD_URL = pool.url
+
+        async def local():                         # pragma: no cover - must not run
+            raise AssertionError("local seat must not serve an offloadable request")
+
+        r = asyncio.run(offload.solve_turnstile_maybe_offload(
+            _Req(proxy=proxy), local, "route", lock=_busy_lock()))
+
+        assert r["token"] == "0.pool-token"
+        assert pool.solve_calls[0]["proxy"] == proxy
+    finally:
+        pool.close()
+
 # ── 4. Pool failure -> circuit breaker + local fallback (no raise) ─────
 
 @pytest.mark.parametrize("mode", ["500", "abort", "unreachable"])
@@ -282,6 +343,33 @@ def test_solve_endpoint_offloads_while_local_seat_is_busy(monkeypatch):
         assert body["method"] == "offload"
         assert body["solved"] is True
         assert local_solve == []
+    finally:
+        pool.close()
+
+def test_solve_endpoint_never_offloads_real_page_requests(monkeypatch):
+    """End-to-end: a real SolveRequest with real_page=True must take the local seat
+    even while it's busy, never the pool (SCTG has no jsd/main.js telemetry)."""
+    pool = _StubPool()
+    try:
+        offload._OFFLOAD_ENABLED = True
+        offload._OFFLOAD_URL = pool.url
+        monkeypatch.setattr(server_mod, "_ALLOW_PRIVATE", True)
+        monkeypatch.setattr(tsolve, "_solve_lock", _busy_lock())
+        calls = []
+
+        async def fake_realpage(*a, **k):
+            calls.append(k)
+            return {"token": "local-token", "verify_success": True, "method": "real-page"}
+
+        monkeypatch.setattr(tsolve, "solve_turnstile_realpage", fake_realpage)
+
+        resp = client.post("/solve", json={"type": "turnstile", "real_page": True,
+                                           "sitekey": "0xSITEKEY",
+                                           "url": "http://127.0.0.1/app", "timeout_s": 30})
+        assert resp.status_code == 200
+        assert resp.json()["token"] == "local-token"
+        assert len(calls) == 1                      # local realpage solver ran
+        assert pool.solve_calls == []               # pool never POSTed
     finally:
         pool.close()
 

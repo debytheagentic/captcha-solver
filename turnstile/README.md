@@ -150,6 +150,12 @@ Two rules, uniform across types:
 
 Rule of thumb: **2xx → read `solved`; non-2xx → read `detail`. Never both.**
 
+`real_page` navigation failure is **fail-fast**: when `page.goto()` raises
+(`TimeoutError`, `ERR_CONNECTION_CLOSED`, `ERR_TIMED_OUT`, `ERR_EMPTY_RESPONSE`, ...)
+the call returns `{"solved": false, "error": "nav_failed: ...", "method": "real-page"}`
+immediately instead of harvesting a blank page — the single seat is released at once
+rather than after `timeout_s`.
+
 `realpage` with `post_fetch` also returns:
 
 ```json
@@ -174,6 +180,12 @@ Rule of thumb: **2xx → read `solved`; non-2xx → read `detail`. Never both.**
 | `TURNSTILE_OFFLOAD_TIMEOUT` | `60` | Offload POST deadline (s) |
 | `TURNSTILE_OFFLOAD_HEALTH_TIMEOUT` | `2.0` | `/health` probe deadline (s) |
 | `TURNSTILE_OFFLOAD_COOLDOWN` | `30` | Breaker cooldown after a failed offload (s) |
+
+The router never offloads a request the pool cannot reproduce: **`real_page: true`**
+(SCTG runs no `jsd/main.js` browser telemetry) and **private-LAN proxies**
+(`192.168.x.x`, `127.0.0.1`, `localhost`, link-local, private IPv6 — SCTG strips them).
+Such tokens fail Cloudflare's server-side validation; those requests wait for the
+local CloakBrowser seat instead.
 
 Proxy is per-request only: pass `"proxy"` on `POST /solve`. No env fallback.
 
