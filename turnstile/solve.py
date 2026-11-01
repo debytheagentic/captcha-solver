@@ -334,7 +334,7 @@ async def _realpage_flow(page, *, url, sitekey, timeout_s, pre_actions, post_fet
 
         # Legacy path: 25 upfront click attempts (default — existing consumers rely on it).
         # Managed/interaction-only widgets (Dahl) render no checkbox at all, so `managed`
-        # skips that block and instead harvests token-first, with one click attempt later.
+        # skips that block and instead polls token-first, clicking once the iframe expands.
         if not managed:
             clicked = await _click_turnstile_checkbox(page)
             log.info("Real-page checkbox clicked=%s", clicked)
@@ -349,14 +349,13 @@ async def _realpage_flow(page, *, url, sitekey, timeout_s, pre_actions, post_fet
                 token = ""
             if token:
                 break
-            if managed and not attempted_click and (time.monotonic() - t0) >= 3.0:
-                attempted_click = True
-                log.info("Real-page: no token after %ds, one checkbox-click attempt",
-                         round(time.monotonic() - t0))
+            if not attempted_click:
                 try:
-                    await _click_turnstile_checkbox(page, attempts=1)
+                    clicked = await _click_turnstile_checkbox(page, attempts=1)
                 except Exception:
-                    pass
+                    clicked = False
+                if clicked:
+                    attempted_click = True
             await asyncio.sleep(1)
 
         fp = await _fingerprint(page)
@@ -399,7 +398,7 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
 
     managed — False (default) keeps the legacy upfront `_click_turnstile_checkbox` (25
     attempts). True is for managed / interaction-only challenges that never render a
-    checkbox: the token is polled for first and at most one click is attempted.
+    checkbox: poll the token first, then click as soon as the expanded iframe resolves.
 
     Selector formats supported: CSS, XPath (//), text=, regex=, role=
     """
@@ -411,4 +410,7 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
 
     async with _solve_lock:
         async with await cloakbrowser.launch_async(**_browser_kwargs(proxy)) as browser:
-            return await _realpage_flow(await browser.new_page(), **opts)
+            context = browser.contexts[0] if browser.contexts else await browser.new_context(
+                viewport={"width": 1920, "height": 1080})
+            page = await context.new_page()
+            return await _realpage_flow(page, **opts)

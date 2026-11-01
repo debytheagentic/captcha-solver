@@ -154,9 +154,15 @@ def test_realpage_nav_failure_fails_fast_without_harvesting(monkeypatch, exc):
         async def close(self):
             calls["closed"] += 1
 
-    class _Browser:
+    class _Context:
         async def new_page(self):
             return _Page()
+
+    class _Browser:
+        contexts = []
+
+        async def new_context(self, **kw):
+            return _Context()
 
     class _Launcher:
         async def __aenter__(self):
@@ -303,7 +309,7 @@ def test_solve_and_verify_returns_fingerprint(monkeypatch):
 def _realpage_fakes(monkeypatch, *, has_widget, token="0.tok"):
     """Install a fake resident CloakBrowser for solve_turnstile_realpage; returns the call log."""
     calls = {"launch": 0, "goto": 0, "inject": 0, "evaluate": [], "click": 0,
-             "page_closed": 0}
+             "page_closed": 0, "viewport": None}
 
     class _Page:
         def __init__(self):
@@ -326,15 +332,23 @@ def _realpage_fakes(monkeypatch, *, has_widget, token="0.tok"):
         async def close(self):
             calls["page_closed"] += 1
 
+    class _Context:
+        async def new_page(self):
+            return _Page()
+
+    class _Browser:
+        contexts = []
+
+        async def new_context(self, **kw):
+            calls["viewport"] = kw.get("viewport")
+            return _Context()
+
     class _Launcher:
         async def __aenter__(self):
-            return self
+            return _Browser()
 
         async def __aexit__(self, *a):
             return False
-
-        async def new_page(self):
-            return _Page()
 
     async def _launch(**_kw):
         calls["launch"] += 1
@@ -379,6 +393,7 @@ def test_realpage_launches_resident_cloakbrowser(monkeypatch):
     r = asyncio.run(solve_turnstile_realpage("https://dahl.example.com/account", "0xSITEKEY"))
 
     assert calls["launch"] == 1
+    assert calls["viewport"] == {"width": 1920, "height": 1080}, "non-desktop viewport"
     assert r["method"] == "real-page" and r["token"] == "0.tok"
 
 
@@ -417,3 +432,22 @@ def test_realpage_managed_true_falls_back_to_one_checkbox_click(monkeypatch):
     assert r["token"] == "" and r["verify_success"] is False
     assert calls["click"] == 1, f"expected one fallback click, got {calls['click']}"
     assert calls["evaluate"].count(_GET_TOKEN_JS) >= 3, "clicked before polling for a token"
+
+
+def test_realpage_managed_true_retries_click_until_the_iframe_expands(monkeypatch):
+    """Managed widgets expand their iframe late: a click that lands on the 1x1 placeholder
+    (returns False) MUST be retried on the next poll, not abandoned after one attempt."""
+    calls = _realpage_fakes(monkeypatch, has_widget=True, token="")
+    click_results = [False, True]          # 1st poll: not expanded yet, 2nd: expanded
+
+    async def _click(page, attempts=25):
+        calls["click"] += 1
+        return click_results.pop(0)
+
+    monkeypatch.setattr("turnstile.solve._click_turnstile_checkbox", _click)
+
+    r = asyncio.run(solve_turnstile_realpage("https://dahl.example.com/account", "0xSITEKEY",
+                                             timeout_s=4, managed=True))
+
+    assert calls["click"] == 2, f"expected a retry after the failed click, got {calls['click']}"
+    assert r["token"] == "" and r["verify_success"] is False
