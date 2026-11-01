@@ -457,3 +457,63 @@ def test_concurrent_burst_keeps_one_local_seat_and_offloads_the_rest():
 async def _seat_taken(seat):
     while not seat.locked():
         await asyncio.sleep(0)
+
+
+# ── 8. /solve carries the Turnstile replay fingerprint ─────────────────
+
+def test_solve_endpoint_returns_turnstile_fingerprint(monkeypatch):
+    """cf_clearance is a plain string on this path (cloudflare returns a dict record):
+    the response model must accept both, and the extra fingerprint keys must survive."""
+    offload._OFFLOAD_ENABLED = False          # free seat -> local lane, no pool probe
+    monkeypatch.setattr(server_mod, "_ALLOW_PRIVATE", True)
+    monkeypatch.setattr(tsolve, "_solve_lock", asyncio.Lock())
+
+    async def fake_solve_turnstile(*a, **k):
+        return {"token": "0.local-token", "expires_in": 300, "elapsed": 1.2, "method": "route",
+                "user_agent": "Mozilla/5.0 Chrome/146.0.0.0 Safari/537.36",
+                "cf_clearance": "cf-clearance-value",
+                "cookies": [{"name": "cf_clearance", "value": "cf-clearance-value"}],
+                "browser": {"major": 146}}
+
+    monkeypatch.setattr(tsolve, "solve_turnstile", fake_solve_turnstile)
+
+    resp = client.post("/solve", json={"type": "turnstile", "sitekey": "0xSITEKEY",
+                                       "url": "http://127.0.0.1/app", "timeout_s": 30})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["token"] == "0.local-token"
+    assert body["cf_clearance"] == "cf-clearance-value"
+    assert body["user_agent"] == "Mozilla/5.0 Chrome/146.0.0.0 Safari/537.36"
+    assert body["cookies"] == [{"name": "cf_clearance", "value": "cf-clearance-value"}]
+    assert body["browser"] == {"major": 146}
+
+
+# ── 9. /solve forwards the realpage `managed` flag (separate query, default legacy) ──
+
+@pytest.mark.parametrize("sent,expected", [(None, False), (True, True), (False, False)])
+def test_solve_endpoint_forwards_managed_flag(monkeypatch, sent, expected):
+    """The operator's contract: existing consumers omit `managed` and keep the legacy
+    click-first path; only an explicit `managed: true` switches to token-first."""
+    offload._OFFLOAD_ENABLED = False          # free seat -> local lane, no pool probe
+    monkeypatch.setattr(server_mod, "_ALLOW_PRIVATE", True)
+    monkeypatch.setattr(tsolve, "_solve_lock", asyncio.Lock())
+    calls = []
+
+    async def fake_realpage(*a, **k):
+        calls.append(k)
+        return {"token": "0.tok", "verify_success": True, "method": "real-page"}
+
+    monkeypatch.setattr(tsolve, "solve_turnstile_realpage", fake_realpage)
+
+    body = {"type": "turnstile", "real_page": True, "sitekey": "0xSITEKEY",
+            "url": "http://127.0.0.1/app", "timeout_s": 30}
+    if sent is not None:
+        body["managed"] = sent
+
+    resp = client.post("/solve", json=body)
+
+    assert resp.status_code == 200
+    assert resp.json()["token"] == "0.tok"
+    assert len(calls) == 1
+    assert calls[0]["managed"] is expected, f"managed={sent!r} reached the solver as {calls[0]['managed']!r}"

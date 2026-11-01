@@ -15,7 +15,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from turnstile.solve import _GET_TOKEN_JS, _WIDGET_INJECT_JS, _turnstile_div, solve_turnstile_realpage
+from turnstile.solve import (_GET_TOKEN_JS, _HAS_WIDGET_JS, _WIDGET_INJECT_JS, _browser_major,
+                             _turnstile_div, solve_and_verify, solve_turnstile,
+                             solve_turnstile_realpage)
+
 
 NODE = shutil.which("node")
 
@@ -176,3 +179,340 @@ def test_realpage_nav_failure_fails_fast_without_harvesting(monkeypatch, exc):
                  "error": f"nav_failed: {exc}",
                  "method": "real-page", "elapsed": r["elapsed"]}
     assert r["elapsed"] < 5
+
+
+# ── Replay fingerprint on the route-intercept solve ──────────────────
+
+_UA_146 = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+_UA_FIREFOX = "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"
+_CF_COOKIE = {"name": "cf_clearance", "value": "cf-clearance-value",
+              "domain": ".dahl.global", "path": "/"}
+
+
+def _fake_browser(monkeypatch, *, ua=_UA_146, cookies=(_CF_COOKIE,), token="0.tok",
+                  prime_fails=False):
+    """Install a fake CloakBrowser answering the route-intercept calls; returns the call log."""
+    calls = {"goto": [], "closed": 0}
+
+    class _Page:
+        def __init__(self):
+            self.context = self          # page.context.cookies() -> the jar
+
+        async def route(self, *a, **k):
+            pass
+
+        async def goto(self, url, **k):
+            calls["goto"].append(k.get("wait_until"))
+            if prime_fails and len(calls["goto"]) == 1:
+                raise RuntimeError("net::ERR_TIMED_OUT")
+
+        async def input_value(self, sel):
+            return token
+
+        async def evaluate(self, js, *a):
+            # Only the fingerprint reads the UA; fetch_from_page wants {status, body}.
+            return ua if "navigator.userAgent" in js else {"status": 200, "body": "{}"}
+
+        async def cookies(self):
+            return list(cookies)
+
+        async def close(self):
+            calls["closed"] += 1
+
+    class _Launcher:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def new_page(self):
+            return _Page()
+
+    async def _launch(**_kw):
+        return _Launcher()
+
+    monkeypatch.setattr("turnstile.solve.cloakbrowser.launch_async", _launch)
+    return calls
+
+
+def test_route_solve_returns_replay_fingerprint(monkeypatch):
+    """A curl_cffi replay needs the UA + cf_clearance + jar that produced the token."""
+    calls = _fake_browser(monkeypatch)
+
+    r = asyncio.run(solve_turnstile("0xSITEKEY", "https://dahl.example.com/signup",
+                                    action="signup"))
+
+    assert r["token"] == "0.tok"
+    assert r["user_agent"] == _UA_146
+    assert r["cf_clearance"] == "cf-clearance-value"
+    assert r["cookies"] == [_CF_COOKIE]
+    assert r["browser"] == {"major": 146}
+    # Phase 1 = real page (networkidle, primes cf_clearance), phase 2 = intercepted shell.
+    assert calls["goto"] == ["networkidle", "domcontentloaded"]
+    assert calls["closed"] == 1
+
+
+def test_route_solve_survives_prime_nav_failure(monkeypatch):
+    """An unreachable target still yields the token — just without a cf_clearance."""
+    calls = _fake_browser(monkeypatch, cookies=(), prime_fails=True)
+
+    r = asyncio.run(solve_turnstile("0xSITEKEY", "https://dead.example.com/"))
+
+    assert r["token"] == "0.tok"
+    assert r["cf_clearance"] is None
+    assert r["cookies"] == []
+    assert calls["goto"] == ["networkidle", "domcontentloaded"]
+
+
+def test_route_solve_major_is_none_without_a_chrome_token(monkeypatch):
+    _fake_browser(monkeypatch, ua=_UA_FIREFOX, cookies=())
+
+    r = asyncio.run(solve_turnstile("0xSITEKEY", "https://example.com/"))
+
+    assert r["browser"] == {"major": None}   # never invent a version the UA doesn't state
+    assert r["user_agent"] == _UA_FIREFOX
+
+
+@pytest.mark.parametrize("ua,expected", [
+    (_UA_146, 146),
+    ("Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/142.0.7444.60 Safari/537.36", 142),
+    (_UA_FIREFOX, None),
+    ("", None),
+    (None, None),
+])
+def test_browser_major_parses_chrome_version_or_falls_back(ua, expected):
+    assert _browser_major(ua) == expected
+
+
+def test_solve_and_verify_returns_fingerprint(monkeypatch):
+    _fake_browser(monkeypatch)
+
+    r = asyncio.run(solve_and_verify("0xSITEKEY", "https://dahl.example.com/api/verify"))
+
+    assert r["verify_status"] == 200
+    assert r["user_agent"] == _UA_146
+    assert r["cf_clearance"] == "cf-clearance-value"
+    assert r["cookies"] == [_CF_COOKIE]
+    assert r["browser"] == {"major": 146}
+
+
+# ── Real-page: resident-browser CDP attach + conditional widget injection ─────
+
+
+# ── Real-page: resident-browser CDP attach + conditional widget injection ─────
+
+@pytest.fixture(autouse=True)
+def _isolate_cdp_env(monkeypatch):
+    """An ambient TURNSTILE_CDP_URL must not leak into the launch-path tests."""
+    monkeypatch.setattr("turnstile.solve.TURNSTILE_CDP_URL", None)
+
+
+def _realpage_fakes(monkeypatch, *, has_widget, cdp_url=None, cdp_error=None, token="0.tok",
+                    pre_action_error=None):
+    """Install fake CDP/local browsers for solve_turnstile_realpage; returns the call log."""
+    calls = {"connect": [], "launch": 0, "new_context": None, "goto": 0, "inject": 0,
+             "evaluate": [], "click": 0, "page_closed": 0, "context_closed": 0,
+             "browser_closed": 0}
+
+    class _Page:
+        def __init__(self):
+            self.context = self        # page.context.cookies() -> the jar
+
+        async def goto(self, *a, **k):
+            calls["goto"] += 1
+
+        async def evaluate(self, js, *a):
+            calls["evaluate"].append(js)
+            if js is _HAS_WIDGET_JS:
+                return has_widget
+            if js is _GET_TOKEN_JS:
+                return token
+            return _UA_146 if "navigator.userAgent" in js else {"status": 200, "body": "{}"}
+
+        async def cookies(self):
+            return [_CF_COOKIE]
+
+        async def close(self):
+            calls["page_closed"] += 1
+
+    class _Context:
+        async def new_page(self):
+            return _Page()
+
+        async def close(self):
+            calls["context_closed"] += 1
+
+    class _CdpBrowser:
+        async def new_context(self, **kw):
+            calls["new_context"] = kw
+            return _Context()
+
+        async def close(self):
+            calls["browser_closed"] += 1
+
+    class _Chromium:
+        async def connect_over_cdp(self, url, **kw):
+            calls["connect"].append(url)
+            if cdp_error:
+                raise cdp_error
+            return _CdpBrowser()
+
+    class _Playwright:
+        chromium = _Chromium()
+
+        async def start(self):
+            return self
+
+        async def stop(self):
+            calls["playwright_stopped"] = calls.get("playwright_stopped", 0) + 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Launcher:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def new_page(self):
+            return _Page()
+
+    async def _launch(**_kw):
+        calls["launch"] += 1
+        return _Launcher()
+
+    async def _no_click(page, attempts=25):
+        calls["click"] += 1
+        return True
+
+    async def _inject(page, sitekey, action=None, cdata=None):
+        calls["inject"] += 1
+
+    monkeypatch.setattr("turnstile.solve.cloakbrowser.launch_async", _launch)
+    monkeypatch.setattr("turnstile.solve.async_playwright", lambda: _Playwright())
+    monkeypatch.setattr("turnstile.solve._click_turnstile_checkbox", _no_click)
+    monkeypatch.setattr("turnstile.solve._inject_turnstile_widget", _inject)
+    monkeypatch.setattr("turnstile.solve.TURNSTILE_CDP_URL", cdp_url)
+    if pre_action_error:
+        async def _raise_pre(page, actions):
+            raise pre_action_error
+
+        monkeypatch.setattr("turnstile.solve.run_pre_actions", _raise_pre)
+    return calls
+
+
+def test_realpage_skips_injection_when_page_has_its_own_widget(monkeypatch):
+    """Dahl renders the widget itself: a second synthetic one conflicts with the native challenge."""
+    calls = _realpage_fakes(monkeypatch, has_widget=True)
+
+    r = asyncio.run(solve_turnstile_realpage("https://dahl.example.com/account", "0xSITEKEY"))
+
+    assert calls["evaluate"][0] is _HAS_WIDGET_JS
+    assert calls["inject"] == 0
+    assert r["token"] == "0.tok"
+
+
+def test_realpage_injects_widget_on_a_bare_page(monkeypatch):
+    calls = _realpage_fakes(monkeypatch, has_widget=False)
+
+    asyncio.run(solve_turnstile_realpage("https://bare.example.com/", "0xSITEKEY"))
+
+    assert calls["inject"] == 1
+
+
+def test_realpage_uses_resident_browser_over_cdp(monkeypatch):
+    calls = _realpage_fakes(monkeypatch, has_widget=True, cdp_url="http://127.0.0.1:9223")
+
+    r = asyncio.run(solve_turnstile_realpage("https://dahl.example.com/account", "0xSITEKEY"))
+
+    assert calls["connect"] == ["http://127.0.0.1:9223"]
+    assert calls["launch"] == 0, "CDP is configured: must not cold-launch"
+    assert calls["new_context"]["viewport"] == {"width": 1920, "height": 1080}
+    assert r["method"] == "real-page"
+    assert r["token"] == "0.tok" and r["user_agent"] == _UA_146
+    assert calls["page_closed"] == 1 and calls["context_closed"] == 1
+    assert calls["browser_closed"] == 1, "CDP connection left dangling"
+    assert calls["playwright_stopped"] == 1, "Playwright driver leaked per CDP solve"
+
+
+def test_realpage_cdp_refused_falls_back_to_local_launch(monkeypatch):
+    calls = _realpage_fakes(monkeypatch, has_widget=True, cdp_url="http://127.0.0.1:9223",
+                            cdp_error=RuntimeError("connect ECONNREFUSED 127.0.0.1:9223"))
+
+    r = asyncio.run(solve_turnstile_realpage("https://dahl.example.com/account", "0xSITEKEY"))
+
+    assert calls["connect"] == ["http://127.0.0.1:9223"]
+    assert calls["launch"] == 1
+    assert r["token"] == "0.tok" and r["method"] == "real-page"
+    assert calls["playwright_stopped"] == 1, "failed CDP attach leaked its driver"
+
+
+@pytest.mark.parametrize("cdp_url", [None, ""])
+def test_realpage_without_cdp_env_launches_locally(monkeypatch, cdp_url):
+    calls = _realpage_fakes(monkeypatch, has_widget=True, cdp_url=cdp_url)
+
+    asyncio.run(solve_turnstile_realpage("https://dahl.example.com/account", "0xSITEKEY"))
+
+    assert calls["connect"] == []
+    assert calls["launch"] == 1
+
+
+def test_realpage_cdp_mid_solve_failure_does_not_cold_launch(monkeypatch):
+    """A failure after acquisition propagates — it must not re-run pre_actions on a new browser."""
+    calls = _realpage_fakes(monkeypatch, has_widget=True, cdp_url="http://127.0.0.1:9223",
+                            pre_action_error=RuntimeError("pre-action click timed out"))
+
+    with pytest.raises(RuntimeError, match="pre-action click timed out"):
+        asyncio.run(solve_turnstile_realpage(
+            "https://dahl.example.com/account", "0xSITEKEY",
+            pre_actions=[{"type": "click", "selector": "text=Create account"}]))
+
+    assert calls["launch"] == 0, "mid-solve failure cold-launched and re-ran the whole flow"
+    assert calls["goto"] == 1, "the page was navigated twice"
+    assert calls["page_closed"] == 1
+    assert calls["context_closed"] == 1 and calls["browser_closed"] == 1
+    assert calls["playwright_stopped"] == 1, "Playwright driver leaked on the failure path"
+
+
+# ── Real-page: `managed` gates token-first vs legacy click-first ──────────────
+
+def test_realpage_managed_false_preserves_legacy_checkbox_click(monkeypatch):
+    """Default (managed=False) is the legacy contract: 25-attempt click before harvesting."""
+    calls = _realpage_fakes(monkeypatch, has_widget=True, token="0.tok")
+
+    r = asyncio.run(solve_turnstile_realpage("https://dahl.example.com/account", "0xSITEKEY"))
+
+    assert calls["click"] == 1, "legacy mode must click the checkbox upfront"
+    assert r["token"] == "0.tok" and r["verify_success"] is True
+
+
+def test_realpage_managed_true_skips_upfront_checkbox_click(monkeypatch):
+    """Managed / interaction-only widgets never render a checkbox: token-first, no upfront click."""
+    calls = _realpage_fakes(monkeypatch, has_widget=True, token="0.tok")
+
+    r = asyncio.run(solve_turnstile_realpage("https://dahl.example.com/account", "0xSITEKEY",
+                                             managed=True))
+
+    assert r["token"] == "0.tok" and r["verify_success"] is True
+    assert calls["click"] == 0, "managed mode clicked the checkbox before waiting for the token"
+    assert calls["evaluate"].count(_GET_TOKEN_JS) == 1, "polled again after the token had arrived"
+    assert r["elapsed"] < 1, "slept between polls despite a token on the first attempt"
+
+
+def test_realpage_managed_true_falls_back_to_one_checkbox_click(monkeypatch):
+    """Managed mode still gets exactly one click attempt when no token ever lands."""
+    calls = _realpage_fakes(monkeypatch, has_widget=True, token="")
+
+    r = asyncio.run(solve_turnstile_realpage("https://dahl.example.com/account", "0xSITEKEY",
+                                             timeout_s=4, managed=True))
+
+    assert r["token"] == "" and r["verify_success"] is False
+    assert calls["click"] == 1, f"expected one fallback click, got {calls['click']}"
+    assert calls["evaluate"].count(_GET_TOKEN_JS) >= 3, "clicked before polling for a token"

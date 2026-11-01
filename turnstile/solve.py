@@ -7,15 +7,20 @@ origin/cookies and stays inside the token's 300s single-use window).
 import asyncio
 import json
 import logging
+import os
+import re
 import time
 from pathlib import Path
 
 import cloakbrowser
+from playwright.async_api import async_playwright
 
 from common.browser import browser_kwargs, run_pre_actions, run_post_fetch, fetch_from_page, route_glob
 
 log = logging.getLogger(__name__)
 _solve_lock = asyncio.Lock()
+# Resident browser (e.g. http://127.0.0.1:9222): connect over CDP instead of a cold launch.
+TURNSTILE_CDP_URL = os.getenv("TURNSTILE_CDP_URL")
 _TEMPLATE_PATH = Path(__file__).parent / "template.html"
 HTML_TEMPLATE = _TEMPLATE_PATH.read_text()
 
@@ -45,6 +50,46 @@ def _turnstile_div(sitekey: str, action: str = None, cdata: str = None) -> str:
 
 
 # ── Route-intercept (fast, generic) ─────────────────────────────────
+_CHROME_MAJOR_RE = re.compile(r"Chrome/(\d+)\.")
+
+
+def _browser_major(user_agent: str | None) -> int | None:
+    """Chrome major out of a UA (`Chrome/146.0.0.0` → 146), else None — never invent one."""
+    m = _CHROME_MAJOR_RE.search(user_agent or "")
+    return int(m.group(1)) if m else None
+
+
+async def _fingerprint(page) -> dict:
+    """Replay material for the token: UA + cf_clearance value + full cookie jar + Chrome major.
+
+    The token is only honoured for the client that produced it, so a caller replaying it
+    (curl_cffi etc.) MUST reuse these verbatim from the SAME egress IP.
+    """
+    try:
+        ua = await page.evaluate("() => navigator.userAgent")
+    except Exception:
+        ua = None
+    try:
+        cookies = await page.context.cookies()
+    except Exception:
+        cookies = []
+    clg = next((c.get("value") for c in cookies if c.get("name") == "cf_clearance"), None)
+    return {"user_agent": ua, "cf_clearance": clg, "cookies": cookies,
+            "browser": {"major": _browser_major(ua)}}
+
+
+async def _prime_cf_clearance(page, target: str) -> None:
+    """Phase 1 of the route solve: load the REAL page once so Cloudflare's JSD can set
+    cf_clearance in the context jar — the intercepted shell never does.
+
+    Best-effort: an unreachable target still yields the token, just without the cookie
+    (the caller sees cf_clearance null instead of a dead solve).
+    """
+    try:
+        await page.goto(target, wait_until="networkidle", timeout=30000)
+    except Exception as e:
+        log.warning("cf_clearance priming nav failed (continuing): %s", e)
+
 
 async def _get_turnstile_response_route(page, max_attempts: int = 25) -> str:
     """Retrieve token from route-intercepted page (Theyka pattern)."""
@@ -68,7 +113,8 @@ async def _get_turnstile_response_route(page, max_attempts: int = 25) -> str:
 
 async def solve_turnstile(sitekey: str, url: str, action: str = None,
                           cdata: str = None, proxy: str = None) -> dict:
-    """Solve Turnstile via route interception. Returns {token, expires_in}."""
+    """Solve Turnstile via route interception. Returns {token, expires_in} plus the
+    replay fingerprint (user_agent, cf_clearance, cookies, browser.major)."""
     t0 = time.monotonic()
     async with _solve_lock:
         target = url
@@ -78,13 +124,18 @@ async def solve_turnstile(sitekey: str, url: str, action: str = None,
         async with await cloakbrowser.launch_async(**_browser_kwargs(proxy)) as browser:
             page = await browser.new_page()
             try:
+                # Phase 1: one real load so Cloudflare's JSD can set cf_clearance on the
+                # origin; best-effort (see _prime_cf_clearance).
+                await _prime_cf_clearance(page, target)
+                # Phase 2: token off the intercepted shell.
                 await page.route(route_glob(target), lambda r: r.fulfill(body=page_data,
                                                              status=200))
                 await page.goto(target, wait_until="domcontentloaded")
                 token = await _get_turnstile_response_route(page)
+                fp = await _fingerprint(page)
                 return {"token": token, "expires_in": 300,
                         "elapsed": round(time.monotonic() - t0, 1),
-                        "method": "route"}
+                        "method": "route", **fp}
             finally:
                 await page.close()
 
@@ -124,12 +175,13 @@ async def solve_and_verify(sitekey: str, verify_url: str,
                 log.info("Route-intercept verify: %d codes=%s",
                          result["status"], codes)
 
+                fp = await _fingerprint(page)
                 return {"token": token, "expires_in": 300,
                         "verify_status": result["status"],
                         "verify_body": result["body"],
                         "verify_error_codes": codes,
                         "method": "route",
-                        "elapsed": round(time.monotonic() - t0, 1)}
+                        "elapsed": round(time.monotonic() - t0, 1), **fp}
             finally:
                 await page.close()
 
@@ -182,6 +234,14 @@ async def _inject_turnstile_widget(page, sitekey: str, action: str = None, cdata
         "action": action,
         "cdata": cdata,
     })
+
+
+# True when the page already renders its own Turnstile widget — injecting a second
+# one creates DOM conflicts and breaks the native challenge.
+_HAS_WIDGET_JS = """
+() => !!document.querySelector(
+  '.cf-turnstile, [name=cf-turnstile-response], iframe[src*="challenges.cloudflare.com"]')
+"""
 
 
 # Multi-vector token harvest: JS API → custom property → input → textarea.
@@ -251,13 +311,109 @@ async def _click_turnstile_checkbox(page, attempts: int = 25) -> bool:
     return False
 
 
+async def _new_cdp_context(proxy: str = None):
+    """Connect to the resident browser behind TURNSTILE_CDP_URL and open a fresh context + page.
+
+    Only the acquire lives here, so a failure raises (having stopped its driver) and the
+    caller can fall back to a local launch — a mid-solve failure must NOT come back through
+    here, or `pre_actions` would fire twice against a second browser. Returns
+    (p, page, context, browser): the caller MUST `await p.stop()` to shut the driver down
+    (`browser.close()` only drops the CDP websocket) — the resident browser keeps running.
+    """
+    p = await async_playwright().start()
+    context = None
+    try:
+        browser = await p.chromium.connect_over_cdp(TURNSTILE_CDP_URL)
+        context = await browser.new_context(
+            proxy={"server": proxy} if proxy else None,
+            viewport={"width": 1920, "height": 1080})
+        page = await context.new_page()
+    except BaseException:
+        if context is not None:   # a new_page failure must not leave the context on the host
+            try:
+                await context.close()
+            except Exception:
+                pass
+        await p.stop()
+        raise
+    return p, page, context, browser
+
+
+async def _realpage_flow(page, *, url, sitekey, timeout_s, pre_actions, post_fetch,
+                         action, cdata, managed=False, t0) -> dict:
+    """Nav → pre_actions → widget → checkbox → harvest → fingerprint on a caller-owned page."""
+    try:
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        except Exception as e:
+            # A failed goto leaves a blank document: no widget, no token. Harvesting
+            # anyway burns the full timeout_s on a dead page while holding the single
+            # seat, so fail fast and release the lock immediately.
+            log.warning("Real-page nav failed: %s", e)
+            return {"token": "", "verify_success": False, "error": f"nav_failed: {e}",
+                    "method": "real-page", "elapsed": round(time.monotonic() - t0, 1)}
+
+        if pre_actions:
+            await run_pre_actions(page, pre_actions)
+            await asyncio.sleep(2)
+
+        # Only inject a sitekey widget when the page has none of its own: a second,
+        # synthetic widget fights the native challenge (DOM conflicts; the page's
+        # own widget never renders).
+        if sitekey and not await page.evaluate(_HAS_WIDGET_JS):
+            await _inject_turnstile_widget(page, sitekey, action=action, cdata=cdata)
+            await asyncio.sleep(3)
+
+        # Legacy path: 25 upfront click attempts (default — existing consumers rely on it).
+        # Managed/interaction-only widgets (Dahl) render no checkbox at all, so `managed`
+        # skips that block and instead harvests token-first, with one click attempt later.
+        if not managed:
+            clicked = await _click_turnstile_checkbox(page)
+            log.info("Real-page checkbox clicked=%s", clicked)
+
+        token = ""
+        attempted_click = not managed
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                token = await page.evaluate(_GET_TOKEN_JS)
+            except Exception:
+                token = ""
+            if token:
+                break
+            if managed and not attempted_click and (time.monotonic() - t0) >= 3.0:
+                attempted_click = True
+                log.info("Real-page: no token after %ds, one checkbox-click attempt",
+                         round(time.monotonic() - t0))
+                try:
+                    await _click_turnstile_checkbox(page, attempts=1)
+                except Exception:
+                    pass
+            await asyncio.sleep(1)
+
+        fp = await _fingerprint(page)
+        result = {"token": token,
+                  "verify_success": bool(token),
+                  "method": "real-page",
+                  "elapsed": round(time.monotonic() - t0, 1), **fp}
+
+        # Post_fetch from the same session (parameterized — injection-safe).
+        if post_fetch and token:
+            result["post_fetch"] = await run_post_fetch(page, post_fetch, token)
+
+        return result
+    finally:
+        await page.close()
+
+
 async def solve_turnstile_realpage(url: str, sitekey: str = None,
                                    timeout_s: int = 60,
                                    pre_actions: list = None,
                                    post_fetch: list = None,
                                    action: str = None,
                                    cdata: str = None,
-                                   proxy: str = None) -> dict:
+                                   proxy: str = None,
+                                   managed: bool = False) -> dict:
     """Navigate a real page, execute pre_actions, click the CF Turnstile checkbox,
     return the token and browser cookies.
 
@@ -273,59 +429,33 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
 
     Use __TOKEN__ placeholder in body to inject the solved Turnstile token.
 
+    managed — False (default) keeps the legacy upfront `_click_turnstile_checkbox` (25
+    attempts). True is for managed / interaction-only challenges that never render a
+    checkbox: the token is polled for first and at most one click is attempted.
+
     Selector formats supported: CSS, XPath (//), text=, regex=, role=
     """
     t0 = time.monotonic()
 
+    opts = {"url": url, "sitekey": sitekey, "timeout_s": timeout_s, "pre_actions": pre_actions,
+            "post_fetch": post_fetch, "action": action, "cdata": cdata, "managed": managed,
+            "t0": t0}
+
     async with _solve_lock:
-        async with await cloakbrowser.launch_async(**_browser_kwargs(proxy)) as browser:
-            page = await browser.new_page()
+        if TURNSTILE_CDP_URL:
             try:
+                p, page, context, browser = await _new_cdp_context(proxy)
+            except Exception as e:
+                log.warning("CDP connection to %s failed (%s), falling back to launch_async",
+                            TURNSTILE_CDP_URL, e)
+            else:
+                # Only the acquire is guarded above: a solve failure here propagates
+                # instead of re-running the flow (pre_actions) on a second browser.
                 try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                except Exception as e:
-                    # A failed goto leaves a blank document: no widget, no token. Harvesting
-                    # anyway burns the full timeout_s on a dead page while holding the single
-                    # seat, so fail fast and release the lock immediately.
-                    log.warning("Real-page nav failed: %s", e)
-                    return {"token": "", "verify_success": False, "error": f"nav_failed: {e}",
-                            "method": "real-page", "elapsed": round(time.monotonic() - t0, 1)}
-
-                if pre_actions:
-                    await run_pre_actions(page, pre_actions)
-                    await asyncio.sleep(2)
-
-                # Inject sitekey widget if given (override page's own).
-                if sitekey:
-                    await _inject_turnstile_widget(page, sitekey, action=action, cdata=cdata)
-                    await asyncio.sleep(3)
-
-                clicked = await _click_turnstile_checkbox(page)
-                log.info("Real-page checkbox clicked=%s", clicked)
-
-                # Harvest token, bounded by timeout_s.
-                token = ""
-                deadline = time.monotonic() + timeout_s
-                while time.monotonic() < deadline:
-                    try:
-                        token = await page.evaluate(_GET_TOKEN_JS)
-                    except Exception:
-                        token = ""
-                    if token:
-                        break
-                    await asyncio.sleep(1)
-
-                cookies = await page.context.cookies()
-                result = {"token": token,
-                          "verify_success": bool(token),
-                          "cookies": cookies,
-                          "method": "real-page",
-                          "elapsed": round(time.monotonic() - t0, 1)}
-
-                # Post_fetch from the same session (parameterized — injection-safe).
-                if post_fetch and token:
-                    result["post_fetch"] = await run_post_fetch(page, post_fetch, token)
-
-                return result
-            finally:
-                await page.close()
+                    return await _realpage_flow(page, **opts)
+                finally:
+                    await context.close()
+                    await browser.close()
+                    await p.stop()
+        async with await cloakbrowser.launch_async(**_browser_kwargs(proxy)) as browser:
+            return await _realpage_flow(await browser.new_page(), **opts)

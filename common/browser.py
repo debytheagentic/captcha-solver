@@ -54,6 +54,9 @@ async def run_pre_actions(page, actions: list):
 
     Each action: {"type": "click|fill|select|press|wait", "selector": "...",
                   "value": "...", "timeout": N}
+    Each selector resolves to its first *visible* match: a page carrying both a hidden
+    mobile and a visible desktop copy of the same control is neither a Playwright
+    strict-mode error nor a click that waits forever on the hidden copy.
     """
     for i, action in enumerate(actions):
         atype = action.get("type", "")
@@ -62,13 +65,13 @@ async def run_pre_actions(page, actions: list):
         timeout = action.get("timeout", 10000)
         log.info("Pre-action %d: %s %s", i + 1, atype, (selector or "")[:60])
         if atype == "click":
-            loc = await resolve_selector(page, selector, timeout)
+            loc = (await resolve_selector(page, selector, timeout)).filter(visible=True).first
             await loc.click(timeout=timeout)
         elif atype == "fill":
-            loc = await resolve_selector(page, selector, timeout)
+            loc = (await resolve_selector(page, selector, timeout)).filter(visible=True).first
             await loc.fill(value, timeout=timeout)
         elif atype == "select":
-            loc = await resolve_selector(page, selector, timeout)
+            loc = (await resolve_selector(page, selector, timeout)).filter(visible=True).first
             await loc.select_option(value, timeout=timeout)
         elif atype == "press":
             await page.keyboard.press(value)

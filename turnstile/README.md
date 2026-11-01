@@ -44,6 +44,12 @@ Use `page_url` to set the page to intercept (defaults to `verify_url` if omitted
 
 Navigates the **actual site**, executes pre-actions, clicks the Turnstile checkbox, and optionally runs post-fetch API calls from the same browser session. The widget is injected with the sitekey handed to the browser as an `evaluate()` argument (never interpolated into the page script), so a sitekey containing special characters can't break out of the markup.
 
+`managed: true` switches the harvest to **token-first**: the upfront 25-attempt checkbox
+click is skipped and the token is polled for every second, with at most one click attempt
+if none has landed. Use it for managed / `interaction-only` challenges (Dahl) that never
+render a checkbox — the default (`false`) keeps the legacy click-first behavior for
+existing consumers.
+
 **Best for:** Sites that reject route-intercept tokens, or where Turnstile appears after user interaction.
 
 ```bash
@@ -135,11 +141,28 @@ All endpoints return:
   "expires_in": 300,
   "method": "route|real-page",
   "elapsed": 22.8,
-  "verify_success": true
+  "verify_success": true,
+  "user_agent": "Mozilla/5.0 ... Chrome/146.0.0.0 Safari/537.36",
+  "cf_clearance": "<cookie value>",
+  "cookies": [ /* full jar — build a Cookie header */ ],
+  "browser": { "major": 146 }
 }
 ```
 
-`solved` is the uniform success signal across every solver type — read it, not the per-type fields. (Other types carry their own detail: `cf_clearance` for cloudflare, `aws_waf_token` for awswaf, `score` for reCAPTCHA v3, etc.)
+Every turnstile answer carries the **replay fingerprint**: `user_agent`, `cf_clearance`
+(the raw cookie value; `null` when the origin set none), `cookies` (the full jar) and
+`browser.major` (Chrome major, for picking a matching `curl_cffi` impersonation such as
+`impersonate="chrome146"`). On the route path the solver loads the **real page once
+first** (`wait_until="networkidle"`, bounded to 30s and tolerant — a nav failure never
+kills the solve) so Cloudflare's JSD can set `cf_clearance` on the origin, and only then
+installs the intercept and harvests the token.
+
+Replaying that token from a headless HTTP client (curl_cffi and friends) needs **all four,
+verbatim, from the same egress IP**: a different UA/IP/JA3 is a different client and the
+origin answers `403 browser_check_failed`. Pass `proxy` so the whole solve runs on the IP
+the replay will use.
+
+`solved` is the uniform success signal across every solver type — read it, not the per-type fields. (Other types carry their own detail: `cf_clearance` for cloudflare — a cookie *record* there, a raw *value* string here — `aws_waf_token` for awswaf, `score` for reCAPTCHA v3, etc.)
 
 ### Error contract
 
@@ -155,6 +178,14 @@ Rule of thumb: **2xx → read `solved`; non-2xx → read `detail`. Never both.**
 the call returns `{"solved": false, "error": "nav_failed: ...", "method": "real-page"}`
 immediately instead of harvesting a blank page — the single seat is released at once
 rather than after `timeout_s`.
+
+
+`real_page` runs on the resident browser when `TURNSTILE_CDP_URL` is set (a context
+instead of a cold launch), and a `sitekey` only triggers the synthetic widget when the
+page has none of its own — sites that render Turnstile themselves (e.g. Dahl) keep
+their native challenge. `pre_actions` selectors target their first *visible* match,
+so responsive pages with a hidden mobile and a visible desktop copy of the same
+control resolve to the desktop one.
 
 `realpage` with `post_fetch` also returns:
 
@@ -175,6 +206,7 @@ rather than after `timeout_s`.
 | `PORT`               | `8877`  | HTTP server port                                |
 | `BROWSER_HEADLESS`   | `1`     | Global. `0` = headed (needs Xvfb). Service sets `0`. |
 | `TURNSTILE_GEOIP`    | —       | Set to `1` to spoof tz/locale/WebGL to match IP |
+| `TURNSTILE_CDP_URL`  | —       | Resident browser CDP endpoint, e.g. `http://127.0.0.1:9222` — `solve_turnstile_realpage` attaches to it instead of cold-launching; refused/unreachable falls back to a local launch |
 | `TURNSTILE_OFFLOAD_ENABLED` | — | Set to `1` to offload solves to a secondary pool when the local seat is busy |
 | `TURNSTILE_OFFLOAD_URL` | — | Pool endpoint, e.g. `http://127.0.0.1:8878/solve` (`{base}/health` is probed first) |
 | `TURNSTILE_OFFLOAD_TIMEOUT` | `60` | Offload POST deadline (s) |

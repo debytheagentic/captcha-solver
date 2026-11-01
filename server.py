@@ -197,6 +197,10 @@ class SolveRequest(BaseModel):
         "call returns 408 and the browser is released.")
     pre_actions: Optional[list[PreAction]] = Field(None, description="Steps to run before solving (real_page).")
     post_fetch: Optional[list[PostFetch]] = Field(None, description="API calls after solving (real_page).")
+    managed: Optional[bool] = Field(
+        False, description="Turnstile real_page only: managed/interaction-only challenge "
+        "(token-first polling, no upfront blocking checkbox click). Default False preserves "
+        "legacy click-first behavior for global consumers.")
     proxy: Optional[str] = Field(
         None, description="Per-request proxy (scheme://user:pass@host:port). Honored for ALL "
         "solver types. No env fallback — omit to solve without proxy. For IP-bound cookies "
@@ -336,12 +340,17 @@ class SolveResponse(BaseModel):
     # Per-type success/detail discriminators (present only for their type):
     verify_success: Optional[bool] = Field(None, description="realpage variants: token harvested + verified.")
     success: Optional[bool] = Field(None, description="Page-level (cloudflare/awswaf): cookie obtained.")
-    cf_clearance: Optional[dict] = Field(None, description="type=cloudflare: the cf_clearance cookie record.")
+    cf_clearance: Optional[str | dict] = Field(None, description="cloudflare: the whole cf_clearance "
+                                               "cookie record. turnstile: the raw cookie VALUE (str, "
+                                               "None when the origin never set one).")
     result: Optional[str] = Field(None, description="OCR text or math result for image captchas.")
     raw_text: Optional[str] = Field(None, description="Raw OCR text before math evaluation.")
     is_math: Optional[bool] = Field(None, description="Whether the captcha was evaluated as math.")
     value: Optional[int] = Field(None, description="Integer result for math captchas.")
-    model_config = {"extra": "allow"}  # solvers add expires_in, score, cookies, user_agent, post_fetch, …
+    # Turnstile (route / real-page / verify) also carries the replay fingerprint —
+    # user_agent, cf_clearance, cookies, browser.major — reuse them verbatim from the
+    # same egress IP the solve ran on (see the turnstile replay note on POST /solve).
+    model_config = {"extra": "allow"}  # solvers add expires_in, score, cookies, browser, post_fetch, ...
 
 
 class ErrorResponse(BaseModel):
@@ -419,7 +428,8 @@ async def _dispatch(req: SolveRequest) -> dict:
                 async def _local():
                     return await solve_turnstile_realpage(
                         req.url, req.sitekey, req.timeout_s, actions, fetches,
-                        action=req.action, cdata=req.cdata, proxy=req.proxy)
+                        action=req.action, cdata=req.cdata, proxy=req.proxy,
+                        managed=bool(req.managed))
             else:
                 kind = "route"
 
@@ -581,6 +591,12 @@ async def solve(req: SolveRequest = Body(..., openapi_examples=_SOLVE_EXAMPLES))
 
     - **Turnstile** — default route-intercept; `verify_url`+`verify_payload` to
       solve-and-verify; `real_page:true` to drive the live page (pre_actions/post_fetch).
+      Every turnstile answer carries the replay fingerprint: `user_agent`, `cf_clearance`,
+      `cookies` and `browser.major` (Chrome major, for picking a matching `curl_cffi`
+      impersonation). On the route path the solver loads the real page first so
+      Cloudflare's JSD can set `cf_clearance`. A caller replaying the token over
+      curl_cffi/HTTP MUST reuse all four verbatim — same egress IP, same UA, same cookie
+      jar — otherwise the origin answers `403 browser_check_failed`.
     - **reCAPTCHA** — `version`: `v2` (checkbox + Mistral image fallback, `real_page` supported),
       `v3` (score; pass `secret` to also return the score; `real_page` supported),
       `invisible` (execute path; `real_page` supported — required for Enterprise keys that

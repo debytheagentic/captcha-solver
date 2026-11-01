@@ -123,6 +123,7 @@ browser.
 | `PORT`                  | `8877`  | Listen port                                 |
 | `BROWSER_HEADLESS`      | per-solver | Global. `0` = headed for ALL browser solvers. Service sets `0`. |
 | `TURNSTILE_GEOIP`       | unset   | `1` = align browser timezone/locale/WebGL to the proxy exit IP (shared by Turnstile + cloudflare + awswaf) |
+| `TURNSTILE_CDP_URL`     | unset   | Resident browser CDP endpoint (e.g. `http://127.0.0.1:9222`). `turnstile_realpage` attaches to it instead of cold-launching; refused/unreachable falls back to a local launch. |
 | `RECAPTCHA_GEOIP`       | unset   | `1` = same geo alignment for the reCAPTCHA browser |
 | `SOLVER_ALLOW_PRIVATE`  | unset   | `1` = allow `url`/`verify_url`/`post_fetch` targets on private/loopback/link-local hosts (SSRF guard off). Leave unset in prod. |
 | `SOLVER_PUBLIC_URL`     | (placeholder) | Public base URL shown in the OpenAPI docs (servers dropdown + contact). Set to your real domain at runtime. |
@@ -155,6 +156,9 @@ when you deliberately need to hit an internal target.
   "action": "submit",            // turnstile/reCAPTCHA action
   "cdata": "...",                // turnstile customer data bound to token
   "real_page": false,            // solve on the live target page, not a stub
+  "managed": false,              // turnstile real_page: true = token-first harvest for
+                                 //   managed/interaction-only widgets (no upfront 25-attempt
+                                 //   checkbox click; one click attempt if no token lands)
   "timeout_s": 60,
   "proxy": "http://user:pass@ip:port",  // all types; per-request only (no env fallback)
   "pre_actions": [               // run before solving (real_page mode)
