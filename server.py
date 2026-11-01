@@ -69,9 +69,9 @@ app = FastAPI(
 # the endpoint proceeds — real enforcement stays at the Caddy layer (public domain only).
 _bearer = HTTPBearer(auto_error=False, description="Bearer token (required on the public "
                      "domain; enforced by the reverse proxy). Ignored for local calls.")
-SUPPORTED = ["turnstile", "recaptcha", "hcaptcha", "cloudflare", "awswaf", "botguard", "datadome", "perimeterx", "akamai", "aliyun", "arkose", "image", "ocr", "math"]
+SUPPORTED = ["turnstile", "recaptcha", "hcaptcha", "cloudflare", "awswaf", "botguard", "datadome", "perimeterx", "akamai", "aliyun", "arkose", "image", "ocr", "math", "clerk_protect"]
 # Page-level solvers that harvest a cookie/token from the live page (no sitekey needed).
-_PAGE_LEVEL = ("cloudflare", "awswaf", "botguard", "datadome", "perimeterx", "akamai")
+_PAGE_LEVEL = ("cloudflare", "awswaf", "botguard", "datadome", "perimeterx", "akamai", "clerk_protect")
 # Solvers that supply their own canonical URL (caller need not pass `url`).
 # datadome is NOT here: the caller passes the DataDome-fronted url (+ referer) itself.
 _SELF_URL = ("botguard", "perimeterx", "aliyun", "arkose", "image", "ocr", "math")
@@ -495,6 +495,14 @@ async def _dispatch(req: SolveRequest) -> dict:
         r = await solve_akamai(req.url, req.proxy, req.timeout_s or 90, actions, fetches)
         return {"type": "akamai", **r}
 
+    if req.type == "clerk_protect":
+        from clerk_protect.solve import solve_clerk_protect
+        actions, _ = _extract(req)
+        r = await solve_clerk_protect(
+            url=req.url, proxy=req.proxy,
+            timeout_s=req.timeout_s or 45, pre_actions=actions)
+        return {"type": "clerk_protect", **r}
+
     if req.type == "aliyun":
         # Dispatch to a SUBPROCESS (aliyun._run), not an inline await. The drag trajectory
         # depends on precise CDP Input.dispatchMouseEvent timing that is fidelity-sensitive
@@ -611,6 +619,12 @@ async def solve(req: SolveRequest = Body(..., openapi_examples=_SOLVE_EXAMPLES))
       `aws-waf-token`, and return it + `user_agent` + all cookies. No `sitekey`; pass
       `proxy` (same IP-bound replay contract as cloudflare). Silent challenge only —
       no interactive visual-puzzle support.
+    - **clerk_protect** — navigate any Clerk-fronted URL (no `sitekey`) and return the
+      Clerk Protect attestation bundle: `token` (`__clerk_protect_token`) + `protect_params`,
+      `cookies`, `user_agent`, `publishable_key`, `fapi_url`, `client_id`. Replay from the
+      same proxy IP with this exact jar/UA and do it immediately — the attestation is
+      short-lived and bound to the session that minted it. `pre_actions` can open the
+      sign-in/sign-up form first when ClerkJS only loads after that interaction.
 
     **Success signal:** every response carries a uniform top-level `solved` bool — read
     it and don't branch per-type. Type-specific detail still rides along (`token`,

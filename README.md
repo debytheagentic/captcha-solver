@@ -9,7 +9,7 @@ for the browser-based paths.
 creation and form recon (CSRF/honeypot scraping, filling account fields) are the
 **caller's** job, not this service.
 
-Supported types (11): **Turnstile**, **reCAPTCHA** (v2 / v3 / invisible, incl.
+Supported types (12): **Turnstile**, **reCAPTCHA** (v2 / v3 / invisible, incl.
 Enterprise), **hCaptcha** (checkbox / invisible / real-page), **Cloudflare**
 (`cf_clearance`), **AWS WAF** (`aws-waf-token`, silent JS challenge), **BotGuard**
 (Google OAuth `bgRequest` token), **DataDome** (`datadome` clearance cookie —
@@ -21,7 +21,10 @@ gesture that drives the SHA-256 hashcash PoW Worker + biomechanics), **Akamai**
 detection + a quadratic handle→piece drag; params `scene_id` + `prefix`, no sitekey),
 **Arkose** (FunCaptcha visual puzzle → `fc_token` via ONNX image classification;
 CloakBrowser intercepts `gfct` challenge, predicts answer per wave, encrypts with
-CryptoJS AES-CBC format, multi-wave pipeline up to 10 rounds).
+CryptoJS AES-CBC format, multi-wave pipeline up to 10 rounds), **Clerk Protect**
+(`__clerk_protect_token` attestation bundle harvested from a live ClerkJS page —
+no sitekey; returns the params + `publishable_key` + `fapi_url` + `client_id` +
+`cookies` + `user_agent` for HTTP replay).
 
 ## Architecture
 
@@ -478,6 +481,23 @@ curl -X POST http://127.0.0.1:8877/solve -H "Content-Type: application/json" \
   dice, shadows, etc.). Unknown variants return `solved:false` with an error.
 - See `arkose/README.md` for full protocol details, model list, and encryption format.
 
+## Clerk Protect (`__clerk_protect_token`)
+
+`POST /solve` with `type: "clerk_protect"` drives the **caller-supplied** Clerk page
+(sign-in, sign-up, or any route that loads ClerkJS — no sitekey needed) and returns
+Clerk's bot-protection attestation bundle: `token` (`__clerk_protect_token`),
+`protect_params` (all three `__clerk_protect_*` values), `publishable_key`, `fapi_url`,
+`client_id`, `cookies` and `user_agent`.
+
+The attestation is minted per page session and bound to that session's cookies +
+User-Agent, so replay the sign-up/sign-in request immediately, from the same proxy IP,
+with this exact jar and UA. ClerkJS 6.x exposes no public accessor for it, so the
+solver registers an `onBeforeRequest` hook on the FAPI client and fires one throwaway
+`signIn.create()` probe, capturing the params Clerk merges into that request body
+(builds that do expose `fapi.getProtectParams()` are called directly). `pre_actions`
+can open the sign-in form first when ClerkJS only loads after that interaction. A page
+that never mints a token inside the poll window answers **500** with the reason.
+
 ## Files
 
 ```
@@ -508,6 +528,8 @@ captcha-solver/
 │   ├── solve.py
 │   ├── _selfcheck.py
 │   └── README.md
+├── clerk_protect/         # Clerk Protect __clerk_protect_* attestation harvest
+│   └── solve.py
 ├── perimeterx/            # HUMAN "Press & Hold" → _px3 (CDP press-hold + PoW)
 │   ├── solve.py           #   site-agnostic core: detect gate → press-hold → harvest
 │   ├── renderers/         #   per-site gate triggers (render_flow param)
