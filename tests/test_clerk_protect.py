@@ -181,8 +181,9 @@ def _install_fake(monkeypatch, *, evaluate_result=_JS_RESULT, existing_context=F
         def contexts(self):
             return [ctx] if existing_context else []
 
-        async def new_context(self):
+        async def new_context(self, **kw):
             calls["new_context"] += 1
+            calls["viewport"] = kw.get("viewport")
             return ctx
 
     class _Launcher:
@@ -218,6 +219,7 @@ def test_solve_clerk_protect_returns_attestation_bundle(monkeypatch):
     assert calls["goto"] == [(_PAGE_URL, "domcontentloaded")]
     assert calls["kwargs"]["proxy"] == "http://127.0.0.1:8080"
     assert calls["closed"] == 1, "browser page leaked"
+    assert calls["viewport"] == {"width": 1920, "height": 1080}
 
 
 @pytest.mark.parametrize("timeout_s,expected_ms", [(45, 20000), (10, 10000)])
@@ -298,6 +300,22 @@ def test_solve_endpoint_returns_the_clerk_protect_bundle(monkeypatch):
     assert body["cookies"] == _COOKIES
     # No sitekey on this lane; the caller's URL is what gets driven.
     assert seen == {"url": _PAGE_URL, "proxy": None, "timeout_s": 30, "pre_actions": None}
+
+
+def test_solve_endpoint_clerk_protect_returns_structured_failure(monkeypatch):
+    """A failing solve (nav/proxy/timeout) must be a 200 {solved: false, error}, not a 500."""
+    async def _boom(*, url, proxy, timeout_s, pre_actions):
+        raise RuntimeError("net::ERR_INVALID_AUTH_CREDENTIALS")
+
+    monkeypatch.setattr("clerk_protect.solve.solve_clerk_protect", _boom)
+
+    resp = client.post("/solve", json={"type": "clerk_protect", "url": _PAGE_URL})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["type"] == "clerk_protect"
+    assert body["solved"] is False
+    assert "ERR_INVALID_AUTH_CREDENTIALS" in body["error"]
 
 
 def test_solve_endpoint_clerk_protect_requires_a_url():

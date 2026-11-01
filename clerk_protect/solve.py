@@ -144,7 +144,8 @@ async def solve_clerk_protect(url: str, proxy: str = None, timeout_s: int = 45,
     poll_ms = max(1000, min(timeout_s * 1000, 20000))
     async with _solve_lock:
         async with await cloakbrowser.launch_async(**_kwargs(proxy)) as browser:
-            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            context = browser.contexts[0] if browser.contexts else await browser.new_context(
+                viewport={"width": 1920, "height": 1080})
             page = await context.new_page()
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=timeout_s * 1000)

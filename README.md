@@ -495,7 +495,9 @@ solver registers an `onBeforeRequest` hook on the FAPI client and fires one thro
 `signIn.create()` probe, capturing the params Clerk merges into that request body
 (builds that do expose `fapi.getProtectParams()` are called directly). `pre_actions`
 can open the sign-in form first when ClerkJS only loads after that interaction. A page
-that never mints a token inside the poll window answers **500** with the reason.
+that never mints a token inside the poll window — or a navigation failure (proxy
+refused, `ERR_INVALID_AUTH_CREDENTIALS`, timeout) — answers **200** with `solved: false`
+and the reason in `error`.
 
 ## Files
 

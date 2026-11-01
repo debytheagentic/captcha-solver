@@ -498,10 +498,16 @@ async def _dispatch(req: SolveRequest) -> dict:
     if req.type == "clerk_protect":
         from clerk_protect.solve import solve_clerk_protect
         actions, _ = _extract(req)
-        r = await solve_clerk_protect(
-            url=req.url, proxy=req.proxy,
-            timeout_s=req.timeout_s or 45, pre_actions=actions)
-        return {"type": "clerk_protect", **r}
+        # Navigation / attestation failures (proxy refused, ERR_INVALID_AUTH_CREDENTIALS,
+        # timeout) surface as a structured 200 {solved: false, error}, not a 500.
+        try:
+            r = await solve_clerk_protect(
+                url=req.url, proxy=req.proxy,
+                timeout_s=req.timeout_s or 45, pre_actions=actions)
+            return {"type": "clerk_protect", **r}
+        except Exception as e:
+            log.warning("clerk_protect solve failed: %s", e)
+            return {"type": "clerk_protect", "solved": False, "error": str(e)}
 
     if req.type == "aliyun":
         # Dispatch to a SUBPROCESS (aliyun._run), not an inline await. The drag trajectory
