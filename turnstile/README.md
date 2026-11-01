@@ -180,8 +180,9 @@ immediately instead of harvesting a blank page — the single seat is released a
 rather than after `timeout_s`.
 
 
-`real_page` runs on the resident browser when `TURNSTILE_CDP_URL` is set (a context
-instead of a cold launch), and a `sitekey` only triggers the synthetic widget when the
+`real_page` is self-contained: it launches the resident CloakBrowser in-process via
+`cloakbrowser.launch_async` — the same runtime as every other solver, with no external
+CDP endpoint. A `sitekey` only triggers the synthetic widget when the
 page has none of its own — sites that render Turnstile themselves (e.g. Dahl) keep
 their native challenge. `pre_actions` selectors target their first *visible* match,
 so responsive pages with a hidden mobile and a visible desktop copy of the same
@@ -206,7 +207,6 @@ control resolve to the desktop one.
 | `PORT`               | `8877`  | HTTP server port                                |
 | `BROWSER_HEADLESS`   | `1`     | Global. `0` = headed (needs Xvfb). Service sets `0`. |
 | `TURNSTILE_GEOIP`    | —       | Set to `1` to spoof tz/locale/WebGL to match IP |
-| `TURNSTILE_CDP_URL`  | —       | Resident browser CDP endpoint, e.g. `http://127.0.0.1:9222` — `solve_turnstile_realpage` attaches to it instead of cold-launching; refused/unreachable falls back to a local launch |
 | `TURNSTILE_OFFLOAD_ENABLED` | — | Set to `1` to offload solves to a secondary pool when the local seat is busy |
 | `TURNSTILE_OFFLOAD_URL` | — | Pool endpoint, e.g. `http://127.0.0.1:8878/solve` (`{base}/health` is probed first) |
 | `TURNSTILE_OFFLOAD_TIMEOUT` | `60` | Offload POST deadline (s) |

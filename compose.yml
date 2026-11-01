@@ -38,7 +38,6 @@ services:
       PORT: "8879"
       BROWSER_HEADLESS: "0"
       TURNSTILE_OFFLOAD_ENABLED: "0"
-      TURNSTILE_CDP_URL: "http://127.0.0.1:9222"
     volumes:
       - ./server.py:/app/server.py:ro
       - ./turnstile:/app/turnstile:ro

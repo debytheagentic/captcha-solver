@@ -7,20 +7,16 @@ origin/cookies and stays inside the token's 300s single-use window).
 import asyncio
 import json
 import logging
-import os
 import re
 import time
 from pathlib import Path
 
 import cloakbrowser
-from playwright.async_api import async_playwright
 
 from common.browser import browser_kwargs, run_pre_actions, run_post_fetch, fetch_from_page, route_glob
 
 log = logging.getLogger(__name__)
 _solve_lock = asyncio.Lock()
-# Resident browser (e.g. http://127.0.0.1:9222): connect over CDP instead of a cold launch.
-TURNSTILE_CDP_URL = os.getenv("TURNSTILE_CDP_URL")
 _TEMPLATE_PATH = Path(__file__).parent / "template.html"
 HTML_TEMPLATE = _TEMPLATE_PATH.read_text()
 
@@ -311,34 +307,6 @@ async def _click_turnstile_checkbox(page, attempts: int = 25) -> bool:
     return False
 
 
-async def _new_cdp_context(proxy: str = None):
-    """Connect to the resident browser behind TURNSTILE_CDP_URL and open a fresh context + page.
-
-    Only the acquire lives here, so a failure raises (having stopped its driver) and the
-    caller can fall back to a local launch — a mid-solve failure must NOT come back through
-    here, or `pre_actions` would fire twice against a second browser. Returns
-    (p, page, context, browser): the caller MUST `await p.stop()` to shut the driver down
-    (`browser.close()` only drops the CDP websocket) — the resident browser keeps running.
-    """
-    p = await async_playwright().start()
-    context = None
-    try:
-        browser = await p.chromium.connect_over_cdp(TURNSTILE_CDP_URL)
-        context = await browser.new_context(
-            proxy={"server": proxy} if proxy else None,
-            viewport={"width": 1920, "height": 1080})
-        page = await context.new_page()
-    except BaseException:
-        if context is not None:   # a new_page failure must not leave the context on the host
-            try:
-                await context.close()
-            except Exception:
-                pass
-        await p.stop()
-        raise
-    return p, page, context, browser
-
-
 async def _realpage_flow(page, *, url, sitekey, timeout_s, pre_actions, post_fetch,
                          action, cdata, managed=False, t0) -> dict:
     """Nav → pre_actions → widget → checkbox → harvest → fingerprint on a caller-owned page."""
@@ -442,20 +410,5 @@ async def solve_turnstile_realpage(url: str, sitekey: str = None,
             "t0": t0}
 
     async with _solve_lock:
-        if TURNSTILE_CDP_URL:
-            try:
-                p, page, context, browser = await _new_cdp_context(proxy)
-            except Exception as e:
-                log.warning("CDP connection to %s failed (%s), falling back to launch_async",
-                            TURNSTILE_CDP_URL, e)
-            else:
-                # Only the acquire is guarded above: a solve failure here propagates
-                # instead of re-running the flow (pre_actions) on a second browser.
-                try:
-                    return await _realpage_flow(page, **opts)
-                finally:
-                    await context.close()
-                    await browser.close()
-                    await p.stop()
         async with await cloakbrowser.launch_async(**_browser_kwargs(proxy)) as browser:
             return await _realpage_flow(await browser.new_page(), **opts)

@@ -298,23 +298,12 @@ def test_solve_and_verify_returns_fingerprint(monkeypatch):
     assert r["browser"] == {"major": 146}
 
 
-# ── Real-page: resident-browser CDP attach + conditional widget injection ─────
+# ── Real-page: conditional widget injection on the resident CloakBrowser ─────
 
-
-# ── Real-page: resident-browser CDP attach + conditional widget injection ─────
-
-@pytest.fixture(autouse=True)
-def _isolate_cdp_env(monkeypatch):
-    """An ambient TURNSTILE_CDP_URL must not leak into the launch-path tests."""
-    monkeypatch.setattr("turnstile.solve.TURNSTILE_CDP_URL", None)
-
-
-def _realpage_fakes(monkeypatch, *, has_widget, cdp_url=None, cdp_error=None, token="0.tok",
-                    pre_action_error=None):
-    """Install fake CDP/local browsers for solve_turnstile_realpage; returns the call log."""
-    calls = {"connect": [], "launch": 0, "new_context": None, "goto": 0, "inject": 0,
-             "evaluate": [], "click": 0, "page_closed": 0, "context_closed": 0,
-             "browser_closed": 0}
+def _realpage_fakes(monkeypatch, *, has_widget, token="0.tok"):
+    """Install a fake resident CloakBrowser for solve_turnstile_realpage; returns the call log."""
+    calls = {"launch": 0, "goto": 0, "inject": 0, "evaluate": [], "click": 0,
+             "page_closed": 0}
 
     class _Page:
         def __init__(self):
@@ -336,43 +325,6 @@ def _realpage_fakes(monkeypatch, *, has_widget, cdp_url=None, cdp_error=None, to
 
         async def close(self):
             calls["page_closed"] += 1
-
-    class _Context:
-        async def new_page(self):
-            return _Page()
-
-        async def close(self):
-            calls["context_closed"] += 1
-
-    class _CdpBrowser:
-        async def new_context(self, **kw):
-            calls["new_context"] = kw
-            return _Context()
-
-        async def close(self):
-            calls["browser_closed"] += 1
-
-    class _Chromium:
-        async def connect_over_cdp(self, url, **kw):
-            calls["connect"].append(url)
-            if cdp_error:
-                raise cdp_error
-            return _CdpBrowser()
-
-    class _Playwright:
-        chromium = _Chromium()
-
-        async def start(self):
-            return self
-
-        async def stop(self):
-            calls["playwright_stopped"] = calls.get("playwright_stopped", 0) + 1
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
 
     class _Launcher:
         async def __aenter__(self):
@@ -396,15 +348,8 @@ def _realpage_fakes(monkeypatch, *, has_widget, cdp_url=None, cdp_error=None, to
         calls["inject"] += 1
 
     monkeypatch.setattr("turnstile.solve.cloakbrowser.launch_async", _launch)
-    monkeypatch.setattr("turnstile.solve.async_playwright", lambda: _Playwright())
     monkeypatch.setattr("turnstile.solve._click_turnstile_checkbox", _no_click)
     monkeypatch.setattr("turnstile.solve._inject_turnstile_widget", _inject)
-    monkeypatch.setattr("turnstile.solve.TURNSTILE_CDP_URL", cdp_url)
-    if pre_action_error:
-        async def _raise_pre(page, actions):
-            raise pre_action_error
-
-        monkeypatch.setattr("turnstile.solve.run_pre_actions", _raise_pre)
     return calls
 
 
@@ -427,58 +372,14 @@ def test_realpage_injects_widget_on_a_bare_page(monkeypatch):
     assert calls["inject"] == 1
 
 
-def test_realpage_uses_resident_browser_over_cdp(monkeypatch):
-    calls = _realpage_fakes(monkeypatch, has_widget=True, cdp_url="http://127.0.0.1:9223")
+def test_realpage_launches_resident_cloakbrowser(monkeypatch):
+    """No CDP attach path: every real_page solve launches the resident CloakBrowser once."""
+    calls = _realpage_fakes(monkeypatch, has_widget=True)
 
     r = asyncio.run(solve_turnstile_realpage("https://dahl.example.com/account", "0xSITEKEY"))
 
-    assert calls["connect"] == ["http://127.0.0.1:9223"]
-    assert calls["launch"] == 0, "CDP is configured: must not cold-launch"
-    assert calls["new_context"]["viewport"] == {"width": 1920, "height": 1080}
-    assert r["method"] == "real-page"
-    assert r["token"] == "0.tok" and r["user_agent"] == _UA_146
-    assert calls["page_closed"] == 1 and calls["context_closed"] == 1
-    assert calls["browser_closed"] == 1, "CDP connection left dangling"
-    assert calls["playwright_stopped"] == 1, "Playwright driver leaked per CDP solve"
-
-
-def test_realpage_cdp_refused_falls_back_to_local_launch(monkeypatch):
-    calls = _realpage_fakes(monkeypatch, has_widget=True, cdp_url="http://127.0.0.1:9223",
-                            cdp_error=RuntimeError("connect ECONNREFUSED 127.0.0.1:9223"))
-
-    r = asyncio.run(solve_turnstile_realpage("https://dahl.example.com/account", "0xSITEKEY"))
-
-    assert calls["connect"] == ["http://127.0.0.1:9223"]
     assert calls["launch"] == 1
-    assert r["token"] == "0.tok" and r["method"] == "real-page"
-    assert calls["playwright_stopped"] == 1, "failed CDP attach leaked its driver"
-
-
-@pytest.mark.parametrize("cdp_url", [None, ""])
-def test_realpage_without_cdp_env_launches_locally(monkeypatch, cdp_url):
-    calls = _realpage_fakes(monkeypatch, has_widget=True, cdp_url=cdp_url)
-
-    asyncio.run(solve_turnstile_realpage("https://dahl.example.com/account", "0xSITEKEY"))
-
-    assert calls["connect"] == []
-    assert calls["launch"] == 1
-
-
-def test_realpage_cdp_mid_solve_failure_does_not_cold_launch(monkeypatch):
-    """A failure after acquisition propagates — it must not re-run pre_actions on a new browser."""
-    calls = _realpage_fakes(monkeypatch, has_widget=True, cdp_url="http://127.0.0.1:9223",
-                            pre_action_error=RuntimeError("pre-action click timed out"))
-
-    with pytest.raises(RuntimeError, match="pre-action click timed out"):
-        asyncio.run(solve_turnstile_realpage(
-            "https://dahl.example.com/account", "0xSITEKEY",
-            pre_actions=[{"type": "click", "selector": "text=Create account"}]))
-
-    assert calls["launch"] == 0, "mid-solve failure cold-launched and re-ran the whole flow"
-    assert calls["goto"] == 1, "the page was navigated twice"
-    assert calls["page_closed"] == 1
-    assert calls["context_closed"] == 1 and calls["browser_closed"] == 1
-    assert calls["playwright_stopped"] == 1, "Playwright driver leaked on the failure path"
+    assert r["method"] == "real-page" and r["token"] == "0.tok"
 
 
 # ── Real-page: `managed` gates token-first vs legacy click-first ──────────────
