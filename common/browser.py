@@ -49,6 +49,31 @@ async def resolve_selector(page, selector: str, timeout: int = 10000):
     return page.locator(selector)
 
 
+async def _locator_action(loc, atype: str, selector: str, value: str, timeout: int):
+    """Run a locator pre-action, retrying on the raw Playwright locator when the
+    humanize engine rejects the selector shape (.filter()/.first chaining)."""
+    try:
+        if atype == "click":
+            await loc.click(timeout=timeout)
+        elif atype == "fill":
+            await loc.fill(value, timeout=timeout)
+        else:
+            await loc.select_option(value, timeout=timeout)
+    except Exception as e:
+        if ("UnsupportedHumanizeSelectorError" not in type(e).__name__
+                and "isolated-world resolver" not in str(e)):
+            raise
+        log.debug("Humanized %s unsupported for %s, falling back to unhumanized: %s",
+                  atype, selector, e)
+        impl = loc._impl_obj
+        if atype == "click":
+            await impl.click(timeout=timeout)
+        elif atype == "fill":
+            await impl.fill(value, timeout=timeout)
+        else:
+            await impl.select_option(value, timeout=timeout)
+
+
 async def run_pre_actions(page, actions: list):
     """Execute a list of pre-actions before solving.
 
@@ -64,15 +89,9 @@ async def run_pre_actions(page, actions: list):
         value = action.get("value", "")
         timeout = action.get("timeout", 10000)
         log.info("Pre-action %d: %s %s", i + 1, atype, (selector or "")[:60])
-        if atype == "click":
+        if atype in ("click", "fill", "select"):
             loc = (await resolve_selector(page, selector, timeout)).filter(visible=True).first
-            await loc.click(timeout=timeout)
-        elif atype == "fill":
-            loc = (await resolve_selector(page, selector, timeout)).filter(visible=True).first
-            await loc.fill(value, timeout=timeout)
-        elif atype == "select":
-            loc = (await resolve_selector(page, selector, timeout)).filter(visible=True).first
-            await loc.select_option(value, timeout=timeout)
+            await _locator_action(loc, atype, selector, value, timeout)
         elif atype == "press":
             await page.keyboard.press(value)
         elif atype == "wait":
