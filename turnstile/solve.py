@@ -289,20 +289,29 @@ async def _human_click_iframe(page, fr) -> bool:
 async def _click_turnstile_checkbox(page, attempts: int = 25) -> bool:
     """Click the checkbox inside the cross-origin Cloudflare iframe.
 
-    Prefers a humanized page-level mouse click on the iframe's box; falls back to
-    a frame-level selector click (not humanized) if the box can't be resolved.
+    Prefers a humanized page-level mouse click on the iframe's box. Selector
+    clicks only run once the iframe is actually expanded (width >= 20): a
+    synthetic click into an unrendered 1x1 placeholder document triggers
+    Cloudflare fraud code 600010 and permanently fails the challenge, so we
+    never blind-click `body`.
     """
     for _ in range(attempts):
         for fr in page.frames:
             if "challenges.cloudflare.com" in (fr.url or ""):
                 if await _human_click_iframe(page, fr):
                     return True
-                for sel in ("input[type=checkbox]", "label", "body"):
-                    try:
-                        await fr.click(sel, timeout=2000)
-                        return True
-                    except Exception:
-                        continue
+                try:
+                    el = await fr.frame_element()
+                    box = await el.bounding_box()
+                    if box and box["width"] >= 20:
+                        for sel in ("input[type=checkbox]", "label"):
+                            try:
+                                await fr.click(sel, timeout=1000)
+                                return True
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
         await asyncio.sleep(1)
     return False
 
