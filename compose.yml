@@ -13,8 +13,40 @@ services:
       TURNSTILE_OFFLOAD_ENABLED: "1"
       TURNSTILE_OFFLOAD_URL: "http://127.0.0.1:8878/solve"
       TURNSTILE_OFFLOAD_TIMEOUT: "60"
+    volumes:
+      - ./server.py:/app/server.py:ro
+      - ./turnstile:/app/turnstile:ro
+      - ./clerk_protect:/app/clerk_protect:ro
+      - ./common:/app/common:ro
+      - /home/eljaladz/.cloakbrowser:/home/solver/.cloakbrowser:rw
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8877/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  farm-solver:
+    image: localhost/captcha-solver:latest
+    container_name: tools-solvers-farm-solver
+    init: true
+    restart: always
+    network_mode: "host"
+    user: "1000:1000"
+    userns_mode: "keep-id"
+    environment:
+      PORT: "8879"
+      BROWSER_HEADLESS: "0"
+      TURNSTILE_OFFLOAD_ENABLED: "0"
+      TURNSTILE_CDP_URL: "http://127.0.0.1:9222"
+    volumes:
+      - ./server.py:/app/server.py:ro
+      - ./turnstile:/app/turnstile:ro
+      - ./clerk_protect:/app/clerk_protect:ro
+      - ./common:/app/common:ro
+      - /home/eljaladz/.cloakbrowser:/home/solver/.cloakbrowser:rw
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8879/health || exit 1"]
       interval: 30s
       timeout: 5s
       start_period: 15s
